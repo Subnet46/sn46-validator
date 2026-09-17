@@ -1,0 +1,11 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock
+/.oracle
+/dist
+.env
+.env.*
+!.env.example

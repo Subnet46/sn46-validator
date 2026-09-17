@@ -1,0 +1,22 @@
+[package]
+name = "sn46-validator-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "2587d615219cfa825cfc7c7fa9b585c7056864ba" }
+libfuzzer-sys = "0.4"
+
+[dependencies.sn46-validator]
+path = ".."
+
+[[bin]]
+name = "epoch_summary_parse"
+path = "fuzz_targets/epoch_summary_parse.rs"
+test = false
+doc = false
+bench = false

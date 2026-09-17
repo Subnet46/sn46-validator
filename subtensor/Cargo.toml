@@ -1,0 +1,8 @@
+[package]
+name = "subtensor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+subxt = { version = "0.50.3", default-features = false, features = ["jsonrpsee", "native"] }

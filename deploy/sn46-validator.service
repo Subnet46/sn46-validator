@@ -1,0 +1,23 @@
+[Unit]
+Description=SN46 localnet validator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=instant
+Group=instant
+EnvironmentFile=/etc/sn46-validator/localnet.env
+ExecStart=/usr/local/bin/sn46-validator
+StateDirectory=sn46-validator
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
