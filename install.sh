@@ -21,14 +21,9 @@ prepare_service() {
         sudo -v
     fi
     service=sn46-validator.service
-    local canonical legacy
-    canonical=$(systemctl show -p LoadState --value "$service")
-    legacy=$(systemctl show -p LoadState --value sn46-subnet.service)
-    [[ $canonical == not-found || $legacy == not-found ]] ||
-        die 'Both validator services exist; choose one before installing to avoid duplicate workers.'
-    if [[ $legacy != not-found ]]; then
-        service=sn46-subnet.service
-    elif [[ $canonical == not-found ]]; then
+    local load_state
+    load_state=$(systemctl show -p LoadState --value "$service")
+    if [[ $load_state == not-found ]]; then
         if [[ ! -r /dev/tty ]] || ! ( : < /dev/tty ) 2>/dev/null; then
             die 'Fresh service setup needs a terminal. Use --no-service for a foreground install.'
         fi

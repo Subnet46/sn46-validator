@@ -78,7 +78,7 @@ echo 'Installer checks passed'
 # and terminal prompts, with systemctl mocked (no host services or live wallet).
 if [[ ${TEST_SYSTEMD:-0} == 1 ]]; then
     [[ -f /.dockerenv && $EUID == 0 ]] || exit 1
-    [[ ! -e /etc/systemd/system/sn46-validator.service && ! -e /etc/systemd/system/sn46-subnet.service ]] || exit 1
+    [[ ! -e /etc/systemd/system/sn46-validator.service ]] || exit 1
     unset INSTALL_DIR
     cp "$test_dir/installed" "$MOCK_ASSETS/sn46-validator-linux-x86_64"
     checksum
@@ -107,27 +107,14 @@ SH
     sed '/^User=/d; /^Group=/d' "$repository_dir/deploy/sn46-validator.service" > "$test_dir/expected-unit"
     sed '/^User=/d' /etc/systemd/system/sn46-validator.service > "$test_dir/actual-unit"
     cmp "$test_dir/expected-unit" "$test_dir/actual-unit"
+    # Upgrades preserve the existing service's explicit network settings.
+    sed -i '/^ExecStart=/i Environment=NETWORK=local NETUID=5' /etc/systemd/system/sn46-validator.service
+    cp /etc/systemd/system/sn46-validator.service "$test_dir/service"
     cp /etc/sn46-validator/config "$test_dir/config"
     bash "$repository_dir/install.sh" > "$test_dir/output"
+    cmp "$test_dir/service" /etc/systemd/system/sn46-validator.service
     cmp "$test_dir/config" /etc/sn46-validator/config
     grep -Fx 'restart sn46-validator.service' "$MOCK_SYSTEMCTL_LOG"
-
-    # Legacy DO service migration preserves its explicit localnet settings and state.
-    mv /etc/systemd/system/sn46-validator.service /etc/systemd/system/sn46-subnet.service
-    sed -i '/^ExecStart=/i Environment=NETWORK=local NETUID=5' /etc/systemd/system/sn46-subnet.service
-    cp /etc/systemd/system/sn46-subnet.service "$test_dir/legacy"
-    : > "$MOCK_SYSTEMCTL_LOG"
-    bash "$repository_dir/install.sh" > "$test_dir/output"
-    cmp "$test_dir/legacy" /etc/systemd/system/sn46-subnet.service
-    grep -Fx 'restart sn46-subnet.service' "$MOCK_SYSTEMCTL_LOG"
-    if grep -q 'restart sn46-validator' "$MOCK_SYSTEMCTL_LOG"; then exit 1; fi
-    grep -Fx 'ExecStart=' /etc/systemd/system/sn46-subnet.service.d/99-sn46-validator.conf
-    [[ ! -f /etc/systemd/system/sn46-validator.service ]]
-
-    # Never start another worker when both service names are configured.
-    cp "$test_dir/legacy" /etc/systemd/system/sn46-validator.service
-    : > "$MOCK_SYSTEMCTL_LOG"
-    if bash "$repository_dir/install.sh" > "$test_dir/output" 2>&1; then exit 1; fi
-    if grep -q '^restart ' "$MOCK_SYSTEMCTL_LOG"; then exit 1; fi
+    grep -Fx 'ExecStart=' /etc/systemd/system/sn46-validator.service.d/99-sn46-validator.conf
     echo 'Systemd installer checks passed'
 fi
