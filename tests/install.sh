@@ -40,6 +40,7 @@ checksum() { (cd "$MOCK_ASSETS" && sha256sum sn46-validator-linux-x86_64 > SHA25
 checksum
 
 # Pipe installation, latest resolution, and replacement with a pinned version.
+# shellcheck disable=SC2002 # Exercise the same piped stdin as curl | bash.
 cat "$repository_dir/install.sh" | bash -s -- --no-service > "$test_dir/output"
 [[ $("$INSTALL_DIR/sn46-validator" --version) == "sn46-validator ${MOCK_VERSION#v}" ]]
 printf 'old binary\n' > "$INSTALL_DIR/sn46-validator"

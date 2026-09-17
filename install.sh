@@ -12,8 +12,9 @@ prompt() {
 
 prepare_service() {
     [[ $install_dir == /usr/local/bin ]] || die 'Custom INSTALL_DIR requires --no-service.'
-    command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] ||
+    if ! command -v systemctl >/dev/null || [[ ! -d /run/systemd/system ]]; then
         die 'systemd is required. Use --no-service for a foreground install.'
+    fi
     if [[ $EUID -ne 0 ]]; then
         command -v sudo >/dev/null || die 'Install sudo or run as root to set up the service.'
         elevate=(sudo)
