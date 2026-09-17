@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,13 +23,30 @@ jobs:
       CARGO_PROFILE_RELEASE_STRIP: symbols
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: ${{ !env.ACT }}
         with:
           persist-credentials: false
+      - name: Prepare local runner
+        if: ${{ env.ACT }}
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends shellcheck
+      - name: Check installer
+        run: |
+          bash -n install.sh tests/install.sh
+          shellcheck install.sh tests/install.sh
+          bash tests/install.sh
       - name: Install Rust
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
           rustup override set 1.98.1
       - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           package_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           [[ "$GITHUB_REF_NAME" == "v$package_version" ]]
@@ -60,14 +78,16 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --offline --workspace --all-targets -- -D warnings
-          cargo test --locked --offline --workspace --all-targets
-          bash -n install.sh tests/install.sh
-          shellcheck install.sh tests/install.sh
-          bash tests/install.sh
+          test_runner=()
+          if [[ "${ACT:-}" == true ]]; then
+            # act runs as root; keep permission-denied tests meaningful.
+            test_runner=(setpriv --bounding-set="-dac_override,-dac_read_search")
+          fi
+          "${test_runner[@]}" cargo test --locked --offline --workspace --all-targets
       - name: Build release
         run: |
           cargo build --release --locked --offline --bin sn46-validator
-          mkdir dist
+          mkdir -p dist
           install -m 0755 target/release/sn46-validator dist/sn46-validator-linux-x86_64
           cd dist
           sha256sum sn46-validator-linux-x86_64 > SHA256SUMS
@@ -80,6 +100,7 @@ jobs:
               "ubuntu:$version" bash /src/tests/install.sh
           done
       - name: Publish release
+        if: ${{ !env.ACT && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
