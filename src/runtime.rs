@@ -96,7 +96,7 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
     }
 
     let records = if already_processed {
-        tracing::info!("epoch_summary_already_processed summary_id={summary_id}");
+        tracing::info!("Summary already processed summary_id={summary_id}");
         Vec::new()
     } else {
         let records = score_epoch_summary(&epoch_summary);
@@ -109,7 +109,7 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         run.state.save(&saved)?;
         log_score_records(&records);
         tracing::info!(
-            "epoch_summary_processed summary_id={summary_id} finalized_block={} miners={}",
+            "Summary verified summary_id={summary_id} finalized_block={} miners={}",
             snapshot.finalized_block,
             records.len()
         );
@@ -124,7 +124,7 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
             .position(|candidate| candidate == hotkey)
             .ok_or_else(|| BurnError("Validator hotkey is not registered".into()))?;
         if snapshot.last_updates[validator_uid] >= epoch_summary_end {
-            tracing::info!("burn_already_on_chain epoch_end_block={epoch_summary_end}");
+            tracing::info!("Weights already on chain epoch_end_block={epoch_summary_end}");
         } else {
             // Retries still need miner scores for partial or zero burn, without logging them again.
             let retry_records = already_processed.then(|| score_epoch_summary(&epoch_summary));
@@ -134,7 +134,9 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
                 retry_records.as_deref().unwrap_or(&records),
                 BurnFraction::CURRENT,
             )?;
-            tracing::info!("burn_submitted epoch_end_block={epoch_summary_end} result={message}");
+            tracing::info!(
+                "✅ Weight submission finalized epoch_end_block={epoch_summary_end} result={message}"
+            );
         }
         run.state.save(&ValidatorState {
             burn_epoch_end_block: Some(epoch_summary_end),
@@ -228,6 +230,7 @@ pub(crate) mod tests {
         pub(crate) fn capture<T>(&self, body: impl FnOnce() -> T) -> T {
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(self.clone())
+                .with_max_level(tracing::Level::DEBUG)
                 .with_level(false)
                 .with_target(false)
                 .without_time()
@@ -306,7 +309,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             messages[messages.len() - 2],
-            "epoch_summary_processed summary_id=local-46-361-720 finalized_block=722 miners=3"
+            "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3"
         );
     }
 
@@ -378,7 +381,7 @@ pub(crate) mod tests {
         assert_eq!(store.load().unwrap().burn_epoch_end_block, Some(720));
         assert_eq!(
             log.messages().last().unwrap(),
-            "burn_already_on_chain epoch_end_block=720"
+            "Weights already on chain epoch_end_block=720"
         );
     }
 
@@ -410,8 +413,8 @@ pub(crate) mod tests {
         assert_eq!(
             log.messages(),
             [
-                "epoch_summary_already_processed summary_id=local-46-361-720",
-                "burn_submitted epoch_end_block=720 result=finalized",
+                "Summary already processed summary_id=local-46-361-720",
+                "✅ Weight submission finalized epoch_end_block=720 result=finalized",
             ]
         );
     }

@@ -76,6 +76,7 @@ jobs:
           for version in 22.04 24.04; do
             docker run --rm -v "$PWD:/src:ro" \
               -e RELEASE_BINARY=/src/dist/sn46-validator-linux-x86_64 \
+              -e TEST_SYSTEMD=1 \
               "ubuntu:$version" bash /src/tests/install.sh
           done
       - name: Publish release

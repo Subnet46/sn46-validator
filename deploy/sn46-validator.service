@@ -1,13 +1,13 @@
 [Unit]
-Description=SN46 localnet validator
+Description=SN46 validator
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=instant
 Group=instant
-EnvironmentFile=/etc/sn46-validator/localnet.env
-ExecStart=/usr/local/bin/sn46-validator
+EnvironmentFile=/etc/sn46-validator/config
+ExecStart=/usr/local/bin/sn46-validator run
 StateDirectory=sn46-validator
 StateDirectoryMode=0700
 UMask=0077

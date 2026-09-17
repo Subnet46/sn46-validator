@@ -1,8 +1,9 @@
+use std::io::IsTerminal;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, CommandFactory, Parser, ValueEnum};
 use sn46_validator::burn::BittensorBurnWriter;
@@ -11,6 +12,10 @@ use sn46_validator::runtime::{Run, RunError, fetch_epoch_summary, run_once};
 use sn46_validator::state::StateStore;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::Writer;
+
+const PLATFORM_URL: &str = "http://107.170.30.202/validator/v1/epoch-summaries/latest";
+const PLATFORM_SIGNER: &str = "5FutpWD5tJHoqaX3DaDwiqn2isxmZ19VeRECRd6vgSif4moZ";
 
 #[derive(Parser)]
 #[command(version, about = "Validate and score signed Platform summaries")]
@@ -33,8 +38,8 @@ enum Command {
 
 #[derive(Args)]
 struct Options {
-    /// Platform SS58 address; required to run the validator.
-    #[arg(long, env = "PLATFORM_SIGNER")]
+    /// Trusted platform SS58 address.
+    #[arg(long, env = "PLATFORM_SIGNER", default_value = PLATFORM_SIGNER)]
     platform_signer: Option<String>,
     /// Chain network: finney, test, or local.
     #[arg(long, env = "NETWORK", default_value = "finney")]
@@ -45,10 +50,11 @@ struct Options {
     /// Override the network's chain endpoint.
     #[arg(long, env = "CHAIN_ENDPOINT", default_value = "")]
     chain_endpoint: String,
-    /// URL serving the latest signed Platform summary; required to run the validator.
+    /// URL serving the latest signed platform summary.
     #[arg(
         long = "platform-epoch-summary-url",
-        env = "PLATFORM_EPOCH_SUMMARY_URL"
+        env = "PLATFORM_EPOCH_SUMMARY_URL",
+        default_value = PLATFORM_URL
     )]
     platform_epoch_summary_url: Option<String>,
     /// File storing processed summaries and finalized burns.
@@ -163,7 +169,7 @@ impl Config {
 
 fn log_outcome(outcome: &Result<(), RunError>) {
     if let Err(error) = outcome {
-        tracing::error!(error = %error, "Validator run failed");
+        tracing::error!(error = %error, "❌ Validator run failed");
     }
 }
 
@@ -184,16 +190,32 @@ async fn serve(config: Config) -> std::io::Result<()> {
             _ = terminate.recv() => true,
         };
         if stopping {
-            tracing::info!("Shutdown requested; waiting for the current validator run");
+            tracing::info!("🛑 Shutdown requested; finishing the current run");
             log_outcome(&attempt.await?);
             return Ok(());
         }
+        tracing::info!("Next check in {}s", config.poll_interval.as_secs());
         tokio::select! {
             _ = tokio::time::sleep(config.poll_interval) => {},
             _ = interrupt.recv() => return Ok(()),
             _ = terminate.recv() => return Ok(()),
         }
     }
+}
+
+fn log_time(writer: &mut Writer<'_>) -> std::fmt::Result {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 86400;
+    write!(
+        writer,
+        "{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 fn main() -> ExitCode {
@@ -203,13 +225,27 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
-        .with_ansi(false)
+        .with_timer(log_time as fn(&mut Writer<'_>) -> std::fmt::Result)
+        .with_ansi(std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
         .init();
     let config = Config::from_options(cli.options).unwrap_or_else(|error| error.exit());
+    let mode = if matches!(cli.command, Command::RunOnce) {
+        "run-once"
+    } else {
+        "run"
+    };
+    tracing::info!(
+        "🚀 Validator started mode={mode} network={} subnet={} wallet={}/{}",
+        config.network,
+        config.netuid,
+        config.wallet_name,
+        config.wallet_hotkey
+    );
     if matches!(cli.command, Command::RunOnce) {
         let outcome = config.run_once();
         log_outcome(&outcome);
         return if outcome.is_ok() {
+            tracing::info!("Run complete");
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -220,10 +256,29 @@ fn main() -> ExitCode {
         .build()
         .and_then(|runtime| runtime.block_on(serve(config)));
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            tracing::info!("🛑 Validator stopped");
+            ExitCode::SUCCESS
+        }
         Err(error) => {
-            tracing::error!(error = %error, "Validator stopped");
+            tracing::error!(error = %error, "❌ Validator stopped");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_mainnet_with_the_trusted_do_platform() {
+        let cli = Cli::try_parse_from(["sn46-validator"]).unwrap();
+        let config = Config::from_options(cli.options).unwrap();
+        assert_eq!(config.network, "finney");
+        assert_eq!(config.netuid.get(), 46);
+        assert!(config.endpoint.is_empty());
+        assert_eq!(config.epoch_summary_url, PLATFORM_URL);
+        assert_eq!(config.platform_signer, PLATFORM_SIGNER);
     }
 }

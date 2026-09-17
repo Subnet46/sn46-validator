@@ -103,8 +103,10 @@ impl Outcome {
             .filter_map(|line| {
                 line.split_once(" INFO ")
                     .or_else(|| line.split_once(" ERROR "))
+                    .or_else(|| line.split_once(" DEBUG "))
             })
             .map(|(_, message)| message.trim().to_owned())
+            .filter(|message| !message.starts_with("🚀") && message != "Run complete")
             .collect()
     }
 }
@@ -118,6 +120,7 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Outcome {
         .args(args)
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("LOG", "info,sn46_validator=debug")
         .envs(env.iter().copied())
         .output()
         .unwrap();
@@ -142,8 +145,8 @@ fn wallet(temp: &tempfile::TempDir) -> String {
 }
 
 #[test]
-fn cli_requires_platform_signer_before_chain_contact() {
-    let outcome = run_once(&[]);
+fn cli_rejects_empty_platform_signer_before_chain_contact() {
+    let outcome = run_once(&[("PLATFORM_SIGNER", "")]);
     assert_eq!(outcome.code, 2);
     assert!(outcome.stderr.contains("PLATFORM_SIGNER is required"));
     for netuid in ["0", "-1", "65536", "18446744073709551616", "nope"] {
@@ -164,7 +167,7 @@ fn cli_requires_platform_signer_before_chain_contact() {
         assert_eq!(outcome.code, 1);
         assert!(outcome.stderr.contains("unknown network: unknown"));
     }
-    for args in [vec![], vec!["other"], vec!["run-once", "extra"]] {
+    for args in [vec!["other"], vec!["run-once", "extra"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_sn46-validator"))
             .args(args)
             .env_clear()
@@ -175,9 +178,8 @@ fn cli_requires_platform_signer_before_chain_contact() {
 }
 
 #[test]
-fn cli_requires_summary_url_before_chain_contact() {
+fn cli_rejects_empty_summary_url_before_chain_contact() {
     for extra in [
-        vec![],
         vec![("PLATFORM_EPOCH_SUMMARY_URL", "")],
         vec![("PLATFORM_EPOCH_SUMMARY_URL", " \t ")],
     ] {
@@ -238,7 +240,7 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
     );
     assert_eq!(
         messages[messages.len() - 2],
-        "epoch_summary_processed summary_id=local-46-361-720 finalized_block=722 miners=3"
+        "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3"
     );
     let golden: Json = serde_json::from_str(include_str!("golden/scoring_cases.json")).unwrap();
     let expected_lines = &golden.as_array().unwrap()[0]["log_lines"];
@@ -263,8 +265,8 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
     assert_eq!(
         second.messages(),
         [
-            "epoch_summary_already_processed summary_id=local-46-361-720",
-            "Validator run failed error=Subnet is not in Burn mode",
+            "Summary already processed summary_id=local-46-361-720",
+            "❌ Validator run failed error=Subnet is not in Burn mode",
         ]
     );
     assert!(
@@ -273,7 +275,7 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
             .contains("\"burn_epoch_end_block\":null")
     );
 
-    // Burn mode restored and the extrinsic succeeds: the exact burn_submitted line.
+    // Burn mode restored and the extrinsic succeeds: the finalization log.
     epoch.set_subtensor("RecycleOrBurn", vec![], 0u8);
     epoch.set_subtensor("CommitRevealWeightsEnabled", vec![], false);
     epoch.set_events(true);
@@ -282,8 +284,8 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
     assert_eq!(
         burned.messages(),
         [
-            "epoch_summary_already_processed summary_id=local-46-361-720",
-            "burn_submitted epoch_end_block=720 result=finalized",
+            "Summary already processed summary_id=local-46-361-720",
+            "✅ Weight submission finalized epoch_end_block=720 result=finalized",
         ]
     );
     assert_eq!(epoch.node.submissions.lock().unwrap().len(), 1);
@@ -297,7 +299,7 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
     assert_eq!(again.code, 0);
     assert_eq!(
         again.messages(),
-        ["epoch_summary_already_processed summary_id=local-46-361-720"]
+        ["Summary already processed summary_id=local-46-361-720"]
     );
     assert_eq!(epoch.node.submissions.lock().unwrap().len(), 1);
 }
@@ -321,7 +323,7 @@ fn chain_mismatch_and_fetch_failures_exit_one() {
     assert_eq!(outcome.code, 1);
     assert_eq!(
         outcome.messages(),
-        ["Validator run failed error=summary is not the latest finalized chain epoch"]
+        ["❌ Validator run failed error=summary is not the latest finalized chain epoch"]
     );
     assert!(!state_path.exists());
     let outcome = run_once(&[
@@ -336,7 +338,7 @@ fn chain_mismatch_and_fetch_failures_exit_one() {
     assert!(
         outcome
             .stderr
-            .contains("Validator run failed error=Platform summary fetch failed: "),
+            .contains("❌ Validator run failed error=Platform summary fetch failed: "),
         "{}",
         outcome.stderr
     );
@@ -449,13 +451,19 @@ fn continuous_mode_retries_failures_without_rescoring_and_stops_on_interrupt() {
     // No arguments starts continuous mode; the environment overrides the state path.
     let mut validator = Running::start(&temp, &node, &epoch_summary_url, &[]);
     validator.wait_for("Validator run failed");
-    validator.wait_for("epoch_summary_already_processed");
+    validator.wait_for("Summary already processed");
     validator.signal("-INT");
     validator.wait_for_success();
     let messages = validator.messages();
-    assert_eq!(messages.matches("miner_score ").count(), 3);
-    assert_eq!(messages.matches("epoch_summary_processed ").count(), 1);
-    assert_eq!(messages.matches("burn_submitted ").count(), 1);
+    assert_eq!(messages.matches("miner_score ").count(), 0);
+    assert!(!messages.contains('\u{1b}'));
+    assert!(messages.contains("🚀 Validator started"));
+    assert!(messages.contains("🛑 Validator stopped"));
+    assert_eq!(messages.matches("Summary verified ").count(), 1);
+    assert_eq!(
+        messages.matches("✅ Weight submission finalized ").count(),
+        1
+    );
     assert_eq!(node.node.submissions.lock().unwrap().len(), 1);
     assert!(
         temp.path()
@@ -484,7 +492,7 @@ fn termination_finishes_an_in_flight_run_before_exiting() {
     assert!(validator.child.try_wait().unwrap().is_none());
     finish_tx.send(()).unwrap();
     validator.wait_for_success();
-    assert!(validator.messages().contains("epoch_summary_processed "));
+    assert!(validator.messages().contains("Summary verified "));
     let state =
         sn46_validator::state::StateStore::new(temp.path().join("state/sn46-validator/state.json"));
     assert_eq!(state.load().unwrap().summary_epoch_end_block, Some(720));
@@ -548,7 +556,7 @@ fn stalled_submission_stops_polls_and_reconciles_without_a_duplicate() {
     let mut updates = vec![0u64; 56];
     updates[0] = FINALIZED;
     node.set_subtensor("LastUpdate", vec![], updates);
-    validator.wait_for("burn_already_on_chain");
+    validator.wait_for("Weights already on chain");
     validator.signal("-TERM");
     validator.wait_for_success();
     assert_eq!(state.load().unwrap().burn_epoch_end_block, Some(720));
@@ -604,7 +612,7 @@ fn cli_flags_override_environment_on_either_side_of_the_command() {
         };
         let outcome = run(&args, &environment);
         assert_eq!(outcome.code, 0, "{}", outcome.stderr);
-        assert!(outcome.stderr.contains("epoch_summary_processed "));
+        assert!(outcome.stderr.contains("Summary verified "));
         assert!(state.is_file());
     }
     assert!(!unused_state.exists());
@@ -653,7 +661,7 @@ fn cli_wallet_flags_expand_home_and_env_cannot_disable_burning() {
         ],
     );
     assert_eq!(outcome.code, 0, "{}", outcome.stderr);
-    assert!(outcome.stderr.contains("burn_submitted "));
+    assert!(outcome.stderr.contains("✅ Weight submission finalized "));
     assert_eq!(node.node.submissions.lock().unwrap().len(), 1);
     let state = sn46_validator::state::StateStore::new(state_path);
     assert_eq!(state.load().unwrap().burn_epoch_end_block, Some(720));

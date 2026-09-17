@@ -12,7 +12,7 @@ pub fn score_line(record: &MinerScore) -> String {
 
 pub fn log_score_records(records: &[MinerScore]) {
     for record in records {
-        tracing::info!("{}", score_line(record));
+        tracing::debug!("{}", score_line(record));
     }
 }
 
