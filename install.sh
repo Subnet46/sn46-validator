@@ -45,7 +45,10 @@ main() {
     "${elevate[@]}" mv -f -- "$staged_path" "$install_dir/sn46-validator"
     staged_path=
     printf 'Installed %s at %s/sn46-validator\n' "$binary_version" "$install_dir"
-    printf 'Load your validator environment, then run: %s/sn46-validator\n' "$install_dir"
+    printf '\nCommands:\n'
+    printf '  %s/sn46-validator run [options]       Run continuously\n' "$install_dir"
+    printf '  %s/sn46-validator run-once [options]  Run once and exit\n' "$install_dir"
+    printf '  %s/sn46-validator --help              Show all options\n' "$install_dir"
 }
 
 main "$@"
