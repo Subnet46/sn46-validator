@@ -12,22 +12,18 @@ prompt() {
 
 prepare_service() {
     [[ $install_dir == /usr/local/bin ]] || die 'Custom INSTALL_DIR requires --no-service.'
-    command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] ||
+    if ! command -v systemctl >/dev/null || [[ ! -d /run/systemd/system ]]; then
         die 'systemd is required. Use --no-service for a foreground install.'
+    fi
     if [[ $EUID -ne 0 ]]; then
         command -v sudo >/dev/null || die 'Install sudo or run as root to set up the service.'
         elevate=(sudo)
         sudo -v
     fi
     service=sn46-validator.service
-    local canonical legacy
-    canonical=$(systemctl show -p LoadState --value "$service")
-    legacy=$(systemctl show -p LoadState --value sn46-subnet.service)
-    [[ $canonical == not-found || $legacy == not-found ]] ||
-        die 'Both validator services exist; choose one before installing to avoid duplicate workers.'
-    if [[ $legacy != not-found ]]; then
-        service=sn46-subnet.service
-    elif [[ $canonical == not-found ]]; then
+    local load_state
+    load_state=$(systemctl show -p LoadState --value "$service")
+    if [[ $load_state == not-found ]]; then
         if [[ ! -r /dev/tty ]] || ! ( : < /dev/tty ) 2>/dev/null; then
             die 'Fresh service setup needs a terminal. Use --no-service for a foreground install.'
         fi
