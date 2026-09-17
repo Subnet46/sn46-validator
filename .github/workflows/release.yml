@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          rustup override set 1.98.1
+      - name: Check release version
+        run: |
+          package_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [[ "$GITHUB_REF_NAME" == "v$package_version" ]]
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Fetch locked dependencies
+        env:
+          SHARED_READ_TOKEN: ${{ secrets.SN46_SHARED_READ_TOKEN }}
+        run: |
+          if [[ -z "$SHARED_READ_TOKEN" ]]; then
+            echo 'Set SN46_SHARED_READ_TOKEN to a token with Contents: read access to sn46-shared.' >&2
+            exit 1
+          fi
+          umask 077
+          askpass="$RUNNER_TEMP/shared-askpass"
+          trap 'rm -f "$askpass"' EXIT
+          cat > "$askpass" <<'SH'
+          #!/usr/bin/env bash
+          case "$1" in
+            *Username*github.com*) printf '%s\n' x-access-token ;;
+            *Password*github.com*) printf '%s\n' "$SHARED_READ_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 0700 "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=
+          CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked
+      - name: Check and test
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --offline --workspace --all-targets -- -D warnings
+          cargo test --locked --offline --workspace --all-targets
+          bash -n install.sh tests/install.sh
+          shellcheck install.sh tests/install.sh
+          bash tests/install.sh
+      - name: Build release
+        run: |
+          cargo build --release --locked --offline --bin sn46-validator
+          mkdir dist
+          install -m 0755 target/release/sn46-validator dist/sn46-validator-linux-x86_64
+          cd dist
+          sha256sum sn46-validator-linux-x86_64 > SHA256SUMS
+      - name: Test Ubuntu compatibility and installation
+        run: |
+          for version in 22.04 24.04; do
+            docker run --rm -v "$PWD:/src:ro" \
+              -e RELEASE_BINARY=/src/dist/sn46-validator-linux-x86_64 \
+              -e TEST_SYSTEMD=1 \
+              "ubuntu:$version" bash /src/tests/install.sh
+          done
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [[ "$existing_draft" == false ]]; then
+            echo 'This release is already published; keeping its existing assets.'
+            exit 0
+          fi
+          printf 'Linux x86_64 binary for Ubuntu 22.04 and newer.\n\nSource: %s\n\nInstall instructions: https://github.com/%s#install\n' \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/release-notes.md"
+          if [[ "$existing_draft" == true ]]; then
+            gh release upload "$GITHUB_REF_NAME" --clobber dist/sn46-validator-linux-x86_64 dist/SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+              --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" \
+              dist/sn46-validator-linux-x86_64 dist/SHA256SUMS
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
