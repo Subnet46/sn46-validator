@@ -11,8 +11,6 @@ SN46 validator for Linux x86_64 (Ubuntu 22.04+). Defaults to **Finney mainnet, s
 - Stable internet connection
 - No GPU required
 
-Our Rust validator runs on a DigitalOcean droplet with these specs.
-
 ## Install
 
 Have your registered wallet on the machine, then run:
