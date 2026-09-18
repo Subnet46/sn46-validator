@@ -2,6 +2,15 @@
 
 SN46 validator for Linux x86_64 (Ubuntu 22.04+). Defaults to **Finney mainnet, subnet 46**, with our platform URL and signer built in.
 
+## Minimum requirements
+
+- 1 vCPU
+- 2 GB RAM
+- 50 GB SSD
+- Ubuntu 22.04+ (x86_64)
+- Stable internet connection
+- No GPU required
+
 ## Install
 
 Have your registered wallet on the machine, then run:
