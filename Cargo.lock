@@ -3523,7 +3523,7 @@ dependencies = [
 [[package]]
 name = "sn46-shared"
 version = "0.1.0"
-source = "git+https://github.com/Subnet46/sn46-shared?rev=13f0ec281bf769b1a15b15002745e4503767e329#13f0ec281bf769b1a15b15002745e4503767e329"
+source = "git+https://github.com/Subnet46/sn46-shared?rev=7747200bf7c4080b1de1820db3ed1a7341f6d52c#7747200bf7c4080b1de1820db3ed1a7341f6d52c"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

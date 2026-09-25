@@ -9,7 +9,7 @@ members = ["subtensor"]
 exclude = ["fuzz"]
 
 [dependencies]
-sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "13f0ec281bf769b1a15b15002745e4503767e329" }
+sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "7747200bf7c4080b1de1820db3ed1a7341f6d52c" }
 ark-serialize = "0.4.2"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 hex = "0.4.3"
