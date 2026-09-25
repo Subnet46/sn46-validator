@@ -334,6 +334,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// The platform publishes every epoch and the validator polls far less often, so the
+    /// summary it fetches is usually the latest, but one fetched just before a step is a
+    /// tempo behind by the time the chain is read. That is refused as stale, not as a
+    /// roster or start mismatch, and the next poll takes the new one.
+    #[test]
+    fn a_summary_one_tempo_behind_the_chain_is_stale() {
+        let epoch_summary = fixture();
+        let base = fixture_snapshot();
+        let next = ChainSnapshot {
+            last_step: base.last_step + base.tempo,
+            finalized_block: base.finalized_block + base.tempo,
+            ..base
+        };
+        assert_eq!(
+            validate_chain(&epoch_summary, &next),
+            Err(ChainError::StaleEpoch)
+        );
+    }
+
     #[test]
     fn golden_validate_chain_verdicts() {
         let cases: Value = serde_json::from_str(
