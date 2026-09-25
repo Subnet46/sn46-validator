@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, CommandFactory, Parser, ValueEnum};
 use sn46_validator::burn::BittensorBurnWriter;
 use sn46_validator::chain::BittensorChain;
-use sn46_validator::runtime::{Run, RunError, fetch_epoch_summary, run_once};
+use sn46_validator::runtime::{Run, RunError, fetch_epoch_summary, next_delay, run_once};
 use sn46_validator::state::StateStore;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
@@ -181,22 +181,21 @@ async fn serve(config: Config) -> std::io::Result<()> {
         let worker_config = Arc::clone(&config);
         // The existing chain and HTTP clients are synchronous; keep them off the signal runtime.
         let mut attempt = tokio::task::spawn_blocking(move || worker_config.run_once());
-        let stopping = tokio::select! {
-            outcome = &mut attempt => {
-                log_outcome(&outcome?);
-                false
-            }
-            _ = interrupt.recv() => true,
-            _ = terminate.recv() => true,
+        let finished = tokio::select! {
+            outcome = &mut attempt => Some(outcome?),
+            _ = interrupt.recv() => None,
+            _ = terminate.recv() => None,
         };
-        if stopping {
+        let Some(outcome) = finished else {
             tracing::info!("🛑 Shutdown requested; finishing the current run");
             log_outcome(&attempt.await?);
             return Ok(());
-        }
-        tracing::info!("Next check in {}s", config.poll_interval.as_secs());
+        };
+        log_outcome(&outcome);
+        let delay = next_delay(&outcome, config.poll_interval);
+        tracing::info!("Next check in {}s", delay.as_secs());
         tokio::select! {
-            _ = tokio::time::sleep(config.poll_interval) => {},
+            _ = tokio::time::sleep(delay) => {},
             _ = interrupt.recv() => return Ok(()),
             _ = terminate.recv() => return Ok(()),
         }

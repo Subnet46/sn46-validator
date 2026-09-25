@@ -28,6 +28,21 @@ pub enum RunError {
 
 pub type Fetch<'a> = &'a dyn Fn(&str, Duration) -> Result<Vec<u8>, RunError>;
 
+/// How soon after a stale summary to look again. The platform publishes each epoch a few
+/// seconds after the chain steps; a poll that lands in that gap sees last epoch's summary.
+pub const STALE_RETRY: Duration = Duration::from_secs(30);
+
+/// The wait before the next run. A stale summary is retried after [`STALE_RETRY`]: with a
+/// poll interval that is a whole number of epochs (1320 s against the localnet's 132 s)
+/// every poll landed in the same gap and failed, so the validator never scored a summary
+/// until it was restarted. Anything else waits the configured interval.
+pub fn next_delay(outcome: &Result<(), RunError>, poll_interval: Duration) -> Duration {
+    match outcome {
+        Err(RunError::Chain(ChainError::StaleEpoch)) => STALE_RETRY.min(poll_interval),
+        _ => poll_interval,
+    }
+}
+
 pub fn fetch_epoch_summary(url: &str, timeout: Duration) -> Result<Vec<u8>, RunError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -149,6 +164,19 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn a_stale_summary_is_retried_soon_and_anything_else_waits_the_interval() {
+        let poll = Duration::from_secs(1320);
+        let stale = Err(RunError::Chain(ChainError::StaleEpoch));
+        assert_eq!(next_delay(&stale, poll), STALE_RETRY);
+        assert_eq!(
+            next_delay(&stale, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(next_delay(&Ok(()), poll), poll);
+        assert_eq!(next_delay(&Err(RunError::Fetch("down".into())), poll), poll);
+    }
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
