@@ -57,7 +57,10 @@ impl BurnFraction {
     /// The share every validator applies; changing it is a release, so validators keep
     /// agreeing on weights. Use FULL for 100%, Self(5_000) for 50%, or NONE for 0%.
     /// At 0%, validators still submit the scored miner weights.
-    pub const CURRENT: Self = Self::FULL;
+    ///
+    /// NONE for the GLM localnet cutover, so a verified miner receives the epoch's
+    /// weight; a Finney release decides its own value.
+    pub const CURRENT: Self = Self::NONE;
 
     pub fn from_bps(bps: u128) -> Result<Self, BurnError> {
         if bps > BPS {
@@ -480,6 +483,21 @@ mod tests {
     }
 
     #[test]
+    fn zero_burn_with_one_scored_miner_gives_it_the_whole_weight() {
+        let records: Vec<_> = scored()
+            .into_iter()
+            .filter(|record| record.normalized_weight > 0)
+            .take(1)
+            .collect();
+        let uid = records[0].miner.uid as u16;
+        assert_ne!(uid, OWNER);
+        assert_eq!(
+            weights(&records, OWNER, BurnFraction::NONE).unwrap(),
+            (vec![uid], vec![65_535])
+        );
+    }
+
+    #[test]
     fn zero_burn_is_the_scored_vector() {
         let records = scored();
         let (dests, values) = weights(&records, OWNER, BurnFraction::NONE).unwrap();
@@ -523,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fraction_is_bounded_and_currently_full() {
+    fn the_fraction_is_bounded_and_currently_none() {
         assert_eq!(BurnFraction::from_bps(0).unwrap(), BurnFraction::NONE);
         assert_eq!(BurnFraction::from_bps(2_500).unwrap(), BurnFraction(2_500));
         assert_eq!(BurnFraction::from_bps(BPS).unwrap(), BurnFraction::FULL);
@@ -531,6 +549,6 @@ mod tests {
             BurnFraction::from_bps(BPS + 1).unwrap_err().0,
             "Burn fraction must be between 0.0 and 1.0"
         );
-        assert_eq!(BurnFraction::CURRENT, BurnFraction::FULL);
+        assert_eq!(BurnFraction::CURRENT, BurnFraction::NONE);
     }
 }
