@@ -427,7 +427,7 @@ pub(crate) mod tests {
 
         let signer = Keypair::from_uri(&"//Dave".parse::<SecretUri>().unwrap()).unwrap();
         let sign = |summary: &mut EpochSummary| {
-            let payload = summary.signing_payload();
+            let payload = summary.signing_payload().unwrap();
             summary.digest = format!("sha256:{}", hex::encode(Sha256::digest(&payload)));
             summary.signature = hex::encode(signer.sign(payload.as_bytes()).0);
         };
@@ -449,7 +449,7 @@ pub(crate) mod tests {
         let mut summary = original;
         summary.created_at_ms = std::num::NonZeroU64::new(summary.created_at_ms.get() + 1).unwrap();
         sign(&mut summary);
-        let changed = |_: &str, _: Duration| Ok(summary.canonical_json().into_bytes());
+        let changed = |_: &str, _: Duration| Ok(summary.canonical_json().unwrap().into_bytes());
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &changed;
         assert!(matches!(
@@ -466,7 +466,7 @@ pub(crate) mod tests {
         sign(&mut summary);
         chain.snapshot.last_step = 1080;
         chain.snapshot.finalized_block = 1082;
-        let fetch = |_: &str, _: Duration| Ok(summary.canonical_json().into_bytes());
+        let fetch = |_: &str, _: Duration| Ok(summary.canonical_json().unwrap().into_bytes());
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &fetch;
         assert_eq!(run_once(&arguments).unwrap().len(), 3);
