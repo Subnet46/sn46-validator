@@ -14,7 +14,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 
-const PLATFORM_URL: &str = "http://107.170.30.202/validator/v1/epoch-summaries/latest";
+/// The platform host by its sslip.io name, hardcoded until the instantnetwork.ai zone moves.
+const PLATFORM_URL: &str = "https://167-172-24-161.sslip.io/validator/v1/epoch-summaries/latest";
 const PLATFORM_SIGNER: &str = "5FutpWD5tJHoqaX3DaDwiqn2isxmZ19VeRECRd6vgSif4moZ";
 
 #[derive(Parser)]
