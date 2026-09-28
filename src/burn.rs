@@ -19,8 +19,8 @@ use subxt::config::DefaultExtrinsicParamsBuilder;
 use subxt::config::RpcConfigFor;
 use subxt::dynamic::{self, Value};
 use subxt::rpcs::methods::legacy::LegacyRpcMethods;
-use subxt::utils::AccountId32;
-use subxt_signer::sr25519::Keypair;
+use subxt::transactions::Signer;
+use subxt::utils::{AccountId32, MultiSignature};
 
 use crate::chain::{At, BittensorChain};
 use sn46_shared::identity::{SS58_FORMAT, encode_ss58};
@@ -320,11 +320,96 @@ impl SubnetBurnState {
     }
 }
 
+/// The substrate signing context, as `sp_core::sr25519` and `subxt_signer` use it.
+const SIGNING_CONTEXT: &[u8] = b"substrate";
+
+/// The validator hotkey as an sr25519 keypair, read from a `bittensor_wallet` JSON file in
+/// either layout: `secretSeed` (a 32-byte mini secret, expanded the ed25519 way as every
+/// substrate tool does) or `privateKey` (the 64-byte expanded secret that btcli v9+ writes).
+pub struct HotkeySigner(schnorrkel::Keypair);
+
+impl HotkeySigner {
+    /// Parse an unencrypted hotkey file, checking its `ss58Address` against the secret.
+    pub fn from_json(raw: &[u8]) -> Result<Self, BurnError> {
+        if raw.starts_with(b"$NACL") {
+            return refuse(
+                "Validator hotkey file is encrypted; the validator needs an unencrypted hotkey",
+            );
+        }
+        let file: Json = serde_json::from_slice(raw)
+            .map_err(|_| BurnError("Validator hotkey file is not JSON".into()))?;
+        let hex_field = |name: &str| -> Result<Option<Vec<u8>>, BurnError> {
+            match file.get(name) {
+                None | Some(Json::Null) => Ok(None),
+                Some(Json::String(text)) => hex::decode(text.trim_start_matches("0x"))
+                    .map(Some)
+                    .map_err(|_| BurnError(format!("Validator hotkey file {name} is not hex"))),
+                Some(_) => refuse(format!("Validator hotkey file {name} is not a string")),
+            }
+        };
+        let keypair = match (hex_field("secretSeed")?, hex_field("privateKey")?) {
+            (Some(seed), _) => {
+                let seed: [u8; 32] = seed.try_into().map_err(|_| {
+                    BurnError("Validator hotkey secretSeed must hold 32 bytes".into())
+                })?;
+                schnorrkel::MiniSecretKey::from_bytes(&seed)
+                    .map_err(|error| {
+                        BurnError(format!("Validator hotkey seed is invalid: {error}"))
+                    })?
+                    .expand_to_keypair(schnorrkel::ExpansionMode::Ed25519)
+            }
+            (None, Some(secret)) => {
+                if secret.len() != 64 {
+                    return refuse("Validator hotkey privateKey must hold 64 bytes");
+                }
+                schnorrkel::SecretKey::from_bytes(&secret)
+                    .map_err(|error| {
+                        BurnError(format!("Validator hotkey privateKey is invalid: {error}"))
+                    })?
+                    .to_keypair()
+            }
+            (None, None) => {
+                return refuse("Validator hotkey file has neither secretSeed nor privateKey");
+            }
+        };
+        let signer = Self(keypair);
+        if file["ss58Address"].as_str() != Some(signer.hotkey().as_str()) {
+            return refuse("Validator hotkey file ss58Address does not match its secret");
+        }
+        Ok(signer)
+    }
+
+    pub fn public(&self) -> [u8; 32] {
+        self.0.public.to_bytes()
+    }
+
+    /// The SS58 address of the public key.
+    pub fn hotkey(&self) -> String {
+        encode_ss58(&self.public(), SS58_FORMAT)
+    }
+
+    pub fn sign_bytes(&self, message: &[u8]) -> [u8; 64] {
+        self.0
+            .sign(schnorrkel::signing_context(SIGNING_CONTEXT).bytes(message))
+            .to_bytes()
+    }
+}
+
+impl Signer<SubstrateConfig> for HotkeySigner {
+    fn account_id(&self) -> AccountId32 {
+        AccountId32(self.public())
+    }
+
+    fn sign(&self, signer_payload: &[u8]) -> MultiSignature {
+        MultiSignature::Sr25519(self.sign_bytes(signer_payload))
+    }
+}
+
 /// Signs with the `bittensor_wallet` hotkey file at `<path>/<name>/hotkeys/<hotkey>` and
 /// writes through the chain reader's connection.
 pub struct BittensorBurnWriter<'a> {
     chain: &'a BittensorChain,
-    keypair: Keypair,
+    signer: HotkeySigner,
     hotkey: String,
     pending_path: PathBuf,
     timeout: Duration,
@@ -354,22 +439,11 @@ impl<'a> BittensorBurnWriter<'a> {
                 "Validator hotkey file is encrypted; the validator needs an unencrypted hotkey",
             );
         }
-        let file: Json = serde_json::from_slice(&raw)
-            .map_err(|_| BurnError("Validator hotkey file is not JSON".into()))?;
-        let seed: [u8; 32] = file["secretSeed"]
-            .as_str()
-            .and_then(|text| hex::decode(text.trim_start_matches("0x")).ok())
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| BurnError("Validator hotkey file has no 32-byte secretSeed".into()))?;
-        let keypair = Keypair::from_secret_key(seed)
-            .map_err(|error| BurnError(format!("Validator hotkey seed is invalid: {error}")))?;
-        let hotkey = encode_ss58(&keypair.public_key().0, SS58_FORMAT);
-        if file["ss58Address"].as_str() != Some(hotkey.as_str()) {
-            return refuse("Validator hotkey file ss58Address does not match its secretSeed");
-        }
+        let signer = HotkeySigner::from_json(&raw)?;
+        let hotkey = signer.hotkey();
         Ok(Self {
             chain,
-            keypair,
+            signer,
             hotkey,
             pending_path: state_path.as_ref().with_added_extension("submission.json"),
             timeout: Duration::from_secs(60),
@@ -461,7 +535,7 @@ impl<'a> BittensorBurnWriter<'a> {
         let methods =
             LegacyRpcMethods::<RpcConfigFor<SubstrateConfig>>::new(self.chain.rpc().clone());
         let nonce = methods
-            .system_account_next_index(&self.keypair.public_key().to_account_id())
+            .system_account_next_index(&self.signer.account_id())
             .await
             .map_err(|error| BurnError(format!("Burn write raised: {error}")))?;
         let params = DefaultExtrinsicParamsBuilder::<SubstrateConfig>::new()
@@ -484,7 +558,7 @@ impl<'a> BittensorBurnWriter<'a> {
             let (commit, round) = crate::commit_reveal::encrypted_weights(
                 &head,
                 netuid,
-                &self.keypair.public_key().0,
+                &self.signer.public(),
                 dests,
                 weights,
                 version,
@@ -502,7 +576,7 @@ impl<'a> BittensorBurnWriter<'a> {
             at.tx()
                 .create_signable_offline(&call, params)
                 .map_err(|error| raised(&error))?
-                .sign(&self.keypair)
+                .sign(&self.signer)
                 .map_err(|error| raised(&error))?
         } else {
             // Encode with live metadata: older localnets use primitive netuid/mecid
@@ -527,7 +601,7 @@ impl<'a> BittensorBurnWriter<'a> {
             at.tx()
                 .create_signable_offline(&call, params)
                 .map_err(|error| raised(&error))?
-                .sign(&self.keypair)
+                .sign(&self.signer)
                 .map_err(|error| raised(&error))?
         };
         self.save_pending(Some(&PendingSubmission {
@@ -598,6 +672,93 @@ mod tests {
     use sn46_shared::scoring::score_epoch_summary;
 
     const OWNER: u16 = 238;
+
+    /// A fresh sr25519 key written the way btcli writes both hotkey layouts.
+    fn hotkey_files() -> (schnorrkel::Keypair, Vec<u8>, Vec<u8>) {
+        let mini = schnorrkel::MiniSecretKey::generate_with(rand_core::OsRng);
+        let keypair = mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519);
+        let public = format!("0x{}", hex::encode(keypair.public.to_bytes()));
+        let ss58 = encode_ss58(&keypair.public.to_bytes(), SS58_FORMAT);
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "accountId": public,
+            "publicKey": public,
+            "secretPhrase": null,
+            "secretSeed": format!("0x{}", hex::encode(mini.to_bytes())),
+            "ss58Address": ss58,
+        }))
+        .unwrap();
+        let v9 = serde_json::to_vec(&serde_json::json!({
+            "accountId": public,
+            "privateKey": format!("0x{}", hex::encode(keypair.secret.to_bytes())),
+            "publicKey": public,
+            "ss58Address": ss58,
+        }))
+        .unwrap();
+        (keypair, legacy, v9)
+    }
+
+    #[test]
+    fn both_hotkey_layouts_load_to_the_same_signer() {
+        let (keypair, legacy, v9) = hotkey_files();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("hotkeys")).unwrap();
+        std::fs::write(dir.path().join("hotkeys/legacy"), &legacy).unwrap();
+        std::fs::write(dir.path().join("hotkeys/v9"), &v9).unwrap();
+        let expected = encode_ss58(&keypair.public.to_bytes(), SS58_FORMAT);
+        for name in ["legacy", "v9"] {
+            let raw = std::fs::read(dir.path().join("hotkeys").join(name)).unwrap();
+            let signer = HotkeySigner::from_json(&raw).unwrap();
+            assert_eq!(signer.hotkey(), expected, "{name}");
+            assert_eq!(signer.public(), keypair.public.to_bytes(), "{name}");
+            assert_eq!(
+                Signer::<SubstrateConfig>::account_id(&signer),
+                AccountId32(keypair.public.to_bytes())
+            );
+            let payload = format!("payload signed through {name}");
+            let MultiSignature::Sr25519(signature) =
+                Signer::<SubstrateConfig>::sign(&signer, payload.as_bytes())
+            else {
+                panic!("sr25519 expected");
+            };
+            let signature = schnorrkel::Signature::from_bytes(&signature).unwrap();
+            keypair
+                .public
+                .verify_simple(SIGNING_CONTEXT, payload.as_bytes(), &signature)
+                .unwrap_or_else(|_| panic!("{name}: signature does not verify"));
+        }
+    }
+
+    #[test]
+    fn hotkey_files_without_a_secret_or_with_the_wrong_address_are_refused() {
+        let (_, legacy, v9) = hotkey_files();
+        let error = |raw: &[u8]| HotkeySigner::from_json(raw).err().unwrap().0;
+        assert_eq!(
+            error(b"{}"),
+            "Validator hotkey file has neither secretSeed nor privateKey"
+        );
+        assert_eq!(
+            error(br#"{"secretSeed":"0x42"}"#),
+            "Validator hotkey secretSeed must hold 32 bytes"
+        );
+        assert_eq!(
+            error(br#"{"privateKey":"0x42"}"#),
+            "Validator hotkey privateKey must hold 64 bytes"
+        );
+        assert_eq!(
+            error(b"$NACL"),
+            "Validator hotkey file is encrypted; the validator needs an unencrypted hotkey"
+        );
+        assert_eq!(error(b"nope"), "Validator hotkey file is not JSON");
+        for raw in [legacy, v9] {
+            let mut file: Json = serde_json::from_slice(&raw).unwrap();
+            file["ss58Address"] =
+                Json::String("5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy".into());
+            assert_eq!(
+                error(&serde_json::to_vec(&file).unwrap()),
+                "Validator hotkey file ss58Address does not match its secret"
+            );
+        }
+    }
 
     fn scored() -> Vec<MinerScore> {
         score_epoch_summary(&fixture())

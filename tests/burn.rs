@@ -494,7 +494,7 @@ fn hotkey_files_are_checked_before_any_chain_contact() {
     assert!(failure(b"$NACL...").contains("encrypted"));
     assert_eq!(
         failure(b"{}"),
-        "Validator hotkey file has no 32-byte secretSeed"
+        "Validator hotkey file has neither secretSeed nor privateKey"
     );
     let swapped = String::from_utf8(good.clone()).unwrap().replace(
         DEVELOPMENT_HOTKEY,
@@ -502,7 +502,7 @@ fn hotkey_files_are_checked_before_any_chain_contact() {
     );
     assert_eq!(
         failure(swapped.as_bytes()),
-        "Validator hotkey file ss58Address does not match its secretSeed"
+        "Validator hotkey file ss58Address does not match its secret"
     );
     assert!(
         BittensorBurnWriter::new(
