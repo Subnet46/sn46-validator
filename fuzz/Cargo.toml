@@ -8,7 +8,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "7747200bf7c4080b1de1820db3ed1a7341f6d52c" }
+sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "26487e1b525ed36505628abe60120941226af24f" }
 libfuzzer-sys = "0.4"
 
 [dependencies.sn46-validator]
