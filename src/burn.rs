@@ -43,7 +43,7 @@ pub trait Burner {
         netuid: u64,
         finalized_block: u64,
         miners: &[MinerScore],
-        burn: BurnFraction,
+        burn: BurnPolicy,
     ) -> Result<String, BurnError>;
 }
 
@@ -54,13 +54,6 @@ pub struct BurnFraction(u128);
 impl BurnFraction {
     pub const NONE: Self = Self(0);
     pub const FULL: Self = Self(BPS);
-    /// The share every validator applies; changing it is a release, so validators keep
-    /// agreeing on weights. Use FULL for 100%, Self(5_000) for 50%, or NONE for 0%.
-    /// At 0%, validators still submit the scored miner weights.
-    ///
-    /// NONE for the GLM localnet cutover, so a verified miner receives the epoch's
-    /// weight; a Finney release decides its own value.
-    pub const CURRENT: Self = Self::NONE;
 
     pub fn from_bps(bps: u128) -> Result<Self, BurnError> {
         if bps > BPS {
@@ -68,6 +61,113 @@ impl BurnFraction {
         }
         Ok(Self(bps))
     }
+}
+
+/// How the burn fraction is chosen for one submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BurnPolicy {
+    Fixed(BurnFraction),
+    /// Burn whatever leaves the miners `miner_target_usd_cents` per epoch, priced from the
+    /// chain at the submission's finalized block and the summary's signed TAO price.
+    Target {
+        miner_target_usd_cents: u64,
+        tao_price_usd_cents: u64,
+    },
+}
+
+/// Whole percents: validators reading the chain a few blocks apart see slightly different
+/// prices, and rounding down to 1% lands them on the same fraction nearly always.
+const BURN_STEP_BPS: u128 = 100;
+const RAO_PER_TAO: u128 = 1_000_000_000;
+const U16_MAX: u128 = u16::MAX as u128;
+
+/// The chain inputs that price one epoch of miner emission, read at one finalized block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochEconomics {
+    /// Alpha rao emitted to the subnet's participants per block.
+    pub alpha_out_emission: u64,
+    pub tempo: u16,
+    /// The owner's share of emission, out of `u16::MAX`.
+    pub owner_cut: u16,
+    /// The pool's TAO and alpha reserves, in rao; their ratio is the spot price.
+    pub subnet_tao: u64,
+    pub subnet_alpha_in: u64,
+}
+
+impl EpochEconomics {
+    async fn read(at: &At, netuid: u16) -> Result<Self, BurnError> {
+        let storage = at.storage();
+        let per_subnet = async |name: &str| -> Result<u64, BurnError> {
+            storage
+                .fetch(
+                    dynamic::storage::<(u16,), u64>("SubtensorModule", name),
+                    (netuid,),
+                )
+                .await
+                .map_err(lookup)?
+                .decode()
+                .map_err(lookup)
+        };
+        let alpha_out_emission = per_subnet("SubnetAlphaOutEmission").await?;
+        let subnet_tao = per_subnet("SubnetTAO").await?;
+        let subnet_alpha_in = per_subnet("SubnetAlphaIn").await?;
+        let owner_cut = storage
+            .fetch(
+                dynamic::storage::<(), u16>("SubtensorModule", "SubnetOwnerCut"),
+                (),
+            )
+            .await
+            .map_err(lookup)?
+            .decode()
+            .map_err(lookup)?;
+        let tempo = crate::chain::read_tempo(at, netuid).await.map_err(lookup)?;
+        Ok(Self {
+            alpha_out_emission,
+            tempo,
+            owner_cut,
+            subnet_tao,
+            subnet_alpha_in,
+        })
+    }
+
+    /// The miners' epoch emission (after the owner cut, half of the rest) valued in TAO rao.
+    pub fn miners_tao_rao(&self) -> Result<u128, BurnError> {
+        if self.subnet_alpha_in == 0 {
+            return refuse("Subnet pool holds no alpha; its price is undefined");
+        }
+        let miners_alpha = u128::from(self.alpha_out_emission)
+            * u128::from(self.tempo)
+            * (U16_MAX - u128::from(self.owner_cut))
+            / (2 * U16_MAX);
+        miners_alpha
+            .checked_mul(u128::from(self.subnet_tao))
+            .map(|value| value / u128::from(self.subnet_alpha_in))
+            .ok_or_else(overflow)
+    }
+
+    /// The largest whole-percent burn that still leaves the miners at least the target;
+    /// NONE when their whole share is worth no more than it.
+    pub fn burn_for_target(
+        &self,
+        miner_target_usd_cents: u64,
+        tao_price_usd_cents: u64,
+    ) -> Result<BurnFraction, BurnError> {
+        let miners_value = self
+            .miners_tao_rao()?
+            .checked_mul(u128::from(tao_price_usd_cents))
+            .ok_or_else(overflow)?;
+        let target_value = u128::from(miner_target_usd_cents) * RAO_PER_TAO;
+        if miners_value <= target_value {
+            return Ok(BurnFraction::NONE);
+        }
+        let keep = (BPS * target_value).div_ceil(miners_value);
+        let burn = BPS - keep;
+        Ok(BurnFraction(burn - burn % BURN_STEP_BPS))
+    }
+}
+
+fn overflow() -> BurnError {
+    BurnError("Miner emission value overflows".into())
 }
 
 /// This epoch's weight vector: every scored miner scaled by `1 - burn`, the freed share on
@@ -304,7 +404,7 @@ impl<'a> BittensorBurnWriter<'a> {
         netuid: u64,
         finalized_block: u64,
         miners: &[MinerScore],
-        burn: BurnFraction,
+        burn: BurnPolicy,
     ) -> Result<String, BurnError> {
         let at = self
             .chain
@@ -316,6 +416,28 @@ impl<'a> BittensorBurnWriter<'a> {
         self.check_pending(netuid, finalized_block)?;
         let subnet = SubnetBurnState::read(&at, netuid).await?;
         let (uid, version) = subnet.check()?;
+        let burn = match burn {
+            BurnPolicy::Fixed(burn) => burn,
+            BurnPolicy::Target {
+                miner_target_usd_cents,
+                tao_price_usd_cents,
+            } => {
+                let economics = EpochEconomics::read(&at, netuid).await?;
+                let burn =
+                    economics.burn_for_target(miner_target_usd_cents, tao_price_usd_cents)?;
+                tracing::info!(
+                    "Burn priced burn_bps={} miners_tao_rao={} miner_target_usd_cents={miner_target_usd_cents} tao_price_usd_cents={tao_price_usd_cents} alpha_out_emission={} tempo={} owner_cut={} subnet_tao={} subnet_alpha_in={}",
+                    burn.0,
+                    economics.miners_tao_rao()?,
+                    economics.alpha_out_emission,
+                    economics.tempo,
+                    economics.owner_cut,
+                    economics.subnet_tao,
+                    economics.subnet_alpha_in,
+                );
+                burn
+            }
+        };
         let (dests, weights) = weights(miners, uid, burn)?;
 
         // Use a pool-aware nonce, but a mortal era so an uncertain transaction cannot
@@ -444,7 +566,7 @@ impl Burner for BittensorBurnWriter<'_> {
         netuid: u64,
         finalized_block: u64,
         miners: &[MinerScore],
-        burn: BurnFraction,
+        burn: BurnPolicy,
     ) -> Result<String, BurnError> {
         self.chain.block_on(async {
             tokio::time::timeout(self.timeout, self.submit_at(netuid, finalized_block, miners, burn))
@@ -541,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fraction_is_bounded_and_currently_none() {
+    fn the_fraction_is_bounded() {
         assert_eq!(BurnFraction::from_bps(0).unwrap(), BurnFraction::NONE);
         assert_eq!(BurnFraction::from_bps(2_500).unwrap(), BurnFraction(2_500));
         assert_eq!(BurnFraction::from_bps(BPS).unwrap(), BurnFraction::FULL);
@@ -549,6 +671,153 @@ mod tests {
             BurnFraction::from_bps(BPS + 1).unwrap_err().0,
             "Burn fraction must be between 0.0 and 1.0"
         );
-        assert_eq!(BurnFraction::CURRENT, BurnFraction::NONE);
+    }
+
+    /// Subnet 46 on Finney, 2026-09-28: 1 alpha per block, tempo 360, an 18% owner cut and
+    /// 0.00358 TAO per alpha.
+    const FINNEY_46: EpochEconomics = EpochEconomics {
+        alpha_out_emission: 1_000_000_000,
+        tempo: 360,
+        owner_cut: 11_796,
+        subnet_tao: 8_515_450_000_000,
+        subnet_alpha_in: 2_378_997_012_605_306,
+    };
+
+    /// What the miners receive under `burn`, in US cents.
+    fn miners_usd_cents(economics: &EpochEconomics, burn: BurnFraction, tao_price: u64) -> u128 {
+        economics.miners_tao_rao().unwrap() * u128::from(tao_price) * (BPS - burn.0)
+            / BPS
+            / RAO_PER_TAO
+    }
+
+    #[test]
+    fn a_hundred_dollar_target_burns_37_percent_on_finney_46() {
+        // 147.6 alpha to the miners, worth 0.528 TAO, $159.34 at $301.60 per TAO.
+        assert_eq!(FINNEY_46.miners_tao_rao().unwrap(), 528_326_614);
+        let burn = FINNEY_46.burn_for_target(10_000, 30_160).unwrap();
+        assert_eq!(burn, BurnFraction(3_700));
+        assert_eq!(miners_usd_cents(&FINNEY_46, burn, 30_160), 10_038);
+    }
+
+    #[test]
+    fn the_burn_rounds_down_so_the_miners_never_fall_short() {
+        for target in [1, 999, 5_000, 10_000, 12_345, 15_933] {
+            for price in [10_000, 30_160, 45_001] {
+                let Ok(burn) = FINNEY_46.burn_for_target(target, price) else {
+                    panic!("{target} at {price}");
+                };
+                assert_eq!(burn.0 % BURN_STEP_BPS, 0);
+                // Exact, in rao-cents scaled by BPS: kept at least the target, and one more
+                // step would have left the miners short.
+                let value = FINNEY_46.miners_tao_rao().unwrap() * u128::from(price);
+                let target = u128::from(target) * RAO_PER_TAO * BPS;
+                if value * BPS <= target {
+                    assert_eq!(burn, BurnFraction::NONE, "{target} at {price}");
+                    continue;
+                }
+                assert!(value * (BPS - burn.0) >= target, "{burn:?} at {price}");
+                if burn.0 + BURN_STEP_BPS <= BPS {
+                    assert!(
+                        value * (BPS - burn.0 - BURN_STEP_BPS) < target,
+                        "{burn:?} at {price}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_share_worth_no_more_than_the_target_is_not_burned() {
+        // $159.34 of miner emission against a $200 target, or an exact match.
+        assert_eq!(
+            FINNEY_46.burn_for_target(20_000, 30_160).unwrap(),
+            BurnFraction::NONE
+        );
+        let no_emission = EpochEconomics {
+            alpha_out_emission: 0,
+            ..FINNEY_46
+        };
+        assert_eq!(
+            no_emission.burn_for_target(10_000, 30_160).unwrap(),
+            BurnFraction::NONE
+        );
+        let no_tao = EpochEconomics {
+            subnet_tao: 0,
+            ..FINNEY_46
+        };
+        assert_eq!(
+            no_tao.burn_for_target(10_000, 30_160).unwrap(),
+            BurnFraction::NONE
+        );
+    }
+
+    #[test]
+    fn an_empty_pool_cannot_price_the_burn() {
+        let empty = EpochEconomics {
+            subnet_alpha_in: 0,
+            ..FINNEY_46
+        };
+        assert_eq!(
+            empty.burn_for_target(10_000, 30_160).unwrap_err().0,
+            "Subnet pool holds no alpha; its price is undefined"
+        );
+    }
+
+    #[test]
+    fn the_owner_cut_and_extreme_reserves_price_without_overflow() {
+        let no_cut = EpochEconomics {
+            owner_cut: 0,
+            ..FINNEY_46
+        };
+        // Half of the emission rather than 41% of it: $194.32.
+        assert_eq!(
+            miners_usd_cents(&no_cut, BurnFraction::NONE, 30_160),
+            19_432
+        );
+        assert_eq!(
+            no_cut.burn_for_target(10_000, 30_160).unwrap(),
+            BurnFraction(4_800)
+        );
+        // A thousand times today's emission, reserves and TAO price still price: $159 billion
+        // of emission against a $100 target burns all but a sliver, rounded down to 99%.
+        let large = EpochEconomics {
+            alpha_out_emission: 1_000 * FINNEY_46.alpha_out_emission,
+            subnet_tao: 1_000 * FINNEY_46.subnet_tao,
+            ..FINNEY_46
+        };
+        assert_eq!(
+            large.burn_for_target(10_000, 30_160_000).unwrap(),
+            BurnFraction(9_900)
+        );
+        let extreme = EpochEconomics {
+            alpha_out_emission: u64::MAX,
+            tempo: u16::MAX,
+            owner_cut: 0,
+            subnet_tao: u64::MAX,
+            subnet_alpha_in: 1,
+        };
+        assert_eq!(
+            extreme.burn_for_target(10_000, 30_160).unwrap_err().0,
+            "Miner emission value overflows"
+        );
+    }
+
+    /// Reads subnet 46's live economics from Finney and prices a $100 target at $300 per
+    /// TAO: `cargo test finney_46_prices_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn finney_46_prices_live() {
+        let chain =
+            BittensorChain::connect("finney", "wss://entrypoint-finney.opentensor.ai:443").unwrap();
+        let economics = chain
+            .block_on(async {
+                let at = chain.client().at_current_block().await.map_err(lookup)?;
+                EpochEconomics::read(&at, 46).await
+            })
+            .unwrap();
+        let burn = economics.burn_for_target(10_000, 30_000).unwrap();
+        println!("{economics:?} burn={burn:?}");
+        assert_eq!(economics.tempo, 360);
+        assert!(economics.subnet_alpha_in > 0);
     }
 }

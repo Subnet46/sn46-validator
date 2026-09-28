@@ -3,11 +3,13 @@
 use std::io::Read;
 use std::time::Duration;
 
-use crate::burn::{BurnError, BurnFraction, Burner};
+use crate::burn::{BurnError, BurnPolicy, Burner};
 use crate::chain::{Chain, ChainError, validate_chain};
 use crate::scoring::log_score_records;
 use crate::state::{StateError, StateStore, ValidatorState};
-use sn46_shared::epoch_summary::{EpochSummaryError, MAX_EPOCH_SUMMARY_BYTES, parse_epoch_summary};
+use sn46_shared::epoch_summary::{
+    EpochSummary, EpochSummaryError, MAX_EPOCH_SUMMARY_BYTES, parse_epoch_summary,
+};
 use sn46_shared::scoring::{MinerScore, score_epoch_summary};
 
 /// Any failure `main` logs as `Validator run failed` and maps to exit code 1.
@@ -82,6 +84,21 @@ pub struct Run<'a> {
     pub fetch: Fetch<'a>,
 }
 
+/// The burn the summary's signed miner target asks for. A summary without one (schema v2)
+/// sets no weights: there is no fixed fraction to fall back on.
+fn target_policy(epoch_summary: &EpochSummary) -> Result<BurnPolicy, BurnError> {
+    match (
+        epoch_summary.miner_target_usd_cents,
+        epoch_summary.tao_price_usd_cents,
+    ) {
+        (Some(target), Some(price)) => Ok(BurnPolicy::Target {
+            miner_target_usd_cents: target.get(),
+            tao_price_usd_cents: price.get(),
+        }),
+        _ => Err(BurnError("Summary carries no miner target".into())),
+    }
+}
+
 pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
     let _lock = run.state.lock()?;
     let snapshot = run.chain.snapshot(run.netuid)?;
@@ -141,13 +158,14 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         if snapshot.last_updates[validator_uid] >= epoch_summary_end {
             tracing::info!("Weights already on chain epoch_end_block={epoch_summary_end}");
         } else {
+            let burn = target_policy(&epoch_summary)?;
             // Retries still need miner scores for partial or zero burn, without logging them again.
             let retry_records = already_processed.then(|| score_epoch_summary(&epoch_summary));
             let message = run.burner.submit(
                 epoch_summary.netuid.get(),
                 snapshot.finalized_block,
                 retry_records.as_deref().unwrap_or(&records),
-                BurnFraction::CURRENT,
+                burn,
             )?;
             tracing::info!(
                 "✅ Weight submission finalized epoch_end_block={epoch_summary_end} result={message}"
@@ -187,7 +205,7 @@ pub(crate) mod tests {
     use crate::chain::ChainSnapshot;
     use crate::chain::tests::{fixture, fixture_snapshot, snapshot_of};
 
-    const RAW: &[u8] = include_str!("../tests/fixtures/epoch_summary_v2.json").as_bytes();
+    const RAW: &[u8] = include_str!("../tests/fixtures/epoch_summary_v3.json").as_bytes();
 
     fn raw() -> Vec<u8> {
         RAW.strip_suffix(b"\n").unwrap().to_vec()
@@ -210,6 +228,7 @@ pub(crate) mod tests {
         pub fail: Cell<bool>,
         pub calls: RefCell<Vec<(u64, u64)>>,
         pub scores: RefCell<Vec<Vec<MinerScore>>>,
+        pub burns: RefCell<Vec<BurnPolicy>>,
     }
 
     impl FakeBurner {
@@ -219,6 +238,7 @@ pub(crate) mod tests {
                 fail: Cell::new(fail),
                 calls: RefCell::new(vec![]),
                 scores: RefCell::new(vec![]),
+                burns: RefCell::new(vec![]),
             }
         }
     }
@@ -232,9 +252,10 @@ pub(crate) mod tests {
             netuid: u64,
             finalized_block: u64,
             miners: &[MinerScore],
-            _burn: BurnFraction,
+            burn: BurnPolicy,
         ) -> Result<String, BurnError> {
             self.calls.borrow_mut().push((netuid, finalized_block));
+            self.burns.borrow_mut().push(burn);
             self.scores.borrow_mut().push(miners.to_vec());
             if self.fail.get() {
                 return Err(BurnError("failed".into()));
@@ -342,6 +363,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_summary_without_a_miner_target_is_scored_but_sets_no_weights() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = fixture_snapshot();
+        let burner = FakeBurner::new(&snapshot.hotkeys[12], false);
+        let chain = FixedChain {
+            snapshot,
+            netuids: RefCell::new(vec![]),
+        };
+        let store = StateStore::new(temp.path().join("state.json"));
+        let v2 = |_: &str, _: Duration| {
+            Ok(include_str!("../tests/fixtures/epoch_summary_v2.json")
+                .trim_end()
+                .as_bytes()
+                .to_vec())
+        };
+        let mut arguments = run(&chain, &store, &burner);
+        arguments.fetch = &v2;
+        assert_eq!(
+            run_once(&arguments).unwrap_err().to_string(),
+            "Summary carries no miner target"
+        );
+        assert!(burner.calls.borrow().is_empty());
+        let saved = store.load().unwrap();
+        assert_eq!(saved.summary_epoch_end_block, Some(720));
+        assert_eq!(saved.burn_epoch_end_block, None);
+    }
+
+    #[test]
     fn epoch_summary_and_burn_are_each_handled_once() {
         let temp = tempfile::tempdir().unwrap();
         let snapshot = fixture_snapshot();
@@ -357,6 +406,13 @@ pub(crate) mod tests {
         assert_eq!(first.len(), 3);
         assert!(second.is_empty());
         assert_eq!(*burner.calls.borrow(), [(46, 722)]);
+        assert_eq!(
+            *burner.burns.borrow(),
+            [BurnPolicy::Target {
+                miner_target_usd_cents: 10_000,
+                tao_price_usd_cents: 30_160,
+            }]
+        );
         let saved = store.load().unwrap();
         assert_eq!(saved.summary_id.as_deref(), Some("local-46-361-720"));
         assert_eq!(saved.summary_digest, Some(fixture().digest));

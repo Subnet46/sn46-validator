@@ -279,7 +279,7 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn fixture() -> EpochSummary {
-        serde_json::from_str(include_str!("../tests/fixtures/epoch_summary_v2.json")).unwrap()
+        serde_json::from_str(include_str!("../tests/fixtures/epoch_summary_v3.json")).unwrap()
     }
 
     /// 56 slots, the fixture's miners in theirs.

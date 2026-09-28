@@ -3,7 +3,7 @@
 mod support;
 
 use serde_json::json;
-use sn46_validator::burn::{BittensorBurnWriter, BurnFraction, Burner};
+use sn46_validator::burn::{BittensorBurnWriter, BurnFraction, BurnPolicy, Burner};
 use sn46_validator::chain::{BittensorChain, Chain};
 use support::{Node, fake_node::Cassette};
 
@@ -44,7 +44,9 @@ fn runtime_393_reads_roster_and_finalizes_owner_burn() {
     let writer =
         BittensorBurnWriter::new(&chain, "validator", "default", wallet.path(), &state).unwrap();
     assert_eq!(
-        writer.submit(5, block, &[], BurnFraction::FULL).unwrap(),
+        writer
+            .submit(5, block, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .unwrap(),
         "finalized"
     );
     assert_eq!(node.node.submissions.lock().unwrap().len(), 1);
