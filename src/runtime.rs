@@ -4,7 +4,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use crate::burn::{BurnError, BurnPolicy, Burner};
-use crate::chain::{Chain, ChainError, validate_chain};
+use crate::chain::{Chain, ChainError, ChainSnapshot, validate_chain};
 use crate::scoring::log_score_records;
 use crate::state::{StateError, StateStore, ValidatorState};
 use sn46_shared::epoch_summary::{
@@ -157,6 +157,17 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
             .ok_or_else(|| BurnError("Validator hotkey is not registered".into()))?;
         if snapshot.last_updates[validator_uid] >= epoch_summary_end {
             tracing::info!("Weights already on chain epoch_end_block={epoch_summary_end}");
+        } else if let Some(allowed_from) = rate_limited(&snapshot, validator_uid) {
+            // The chain would reject the extrinsic and the pending record would then lock
+            // submissions for a whole mortal era, so wait quietly: the next poll retries,
+            // and a newer summary supersedes this epoch.
+            tracing::info!(
+                "Weights rate-limited last_update={} limit={} allowed_from_block={allowed_from} finalized_block={}",
+                snapshot.last_updates[validator_uid],
+                snapshot.weights_rate_limit,
+                snapshot.finalized_block
+            );
+            return Ok(records);
         } else {
             let burn = target_policy(&epoch_summary)?;
             // Retries still need miner scores for partial or zero burn, without logging them again.
@@ -177,6 +188,15 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         })?;
     }
     Ok(records)
+}
+
+/// The first block at which `WeightsSetRateLimit` lets this validator set weights again,
+/// when that is still ahead of the finalized head. A validator that never set weights is
+/// never limited.
+fn rate_limited(snapshot: &ChainSnapshot, validator_uid: usize) -> Option<u64> {
+    let last_update = snapshot.last_updates[validator_uid];
+    let allowed_from = last_update.saturating_add(snapshot.weights_rate_limit);
+    (last_update > 0 && allowed_from > snapshot.finalized_block).then_some(allowed_from)
 }
 
 #[cfg(test)]
@@ -202,7 +222,6 @@ pub(crate) mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::chain::ChainSnapshot;
     use crate::chain::tests::{fixture, fixture_snapshot, snapshot_of};
 
     const RAW: &[u8] = include_str!("../tests/fixtures/epoch_summary_v3.json").as_bytes();
@@ -467,6 +486,55 @@ pub(crate) mod tests {
             log.messages().last().unwrap(),
             "Weights already on chain epoch_end_block=720"
         );
+    }
+
+    /// A weight set 40 blocks before the finalized head under a 100-block limit is skipped
+    /// without touching the burner or the state, so the next poll retries it.
+    #[test]
+    fn rate_limited_weights_wait_for_the_next_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture_snapshot();
+        snapshot.last_updates[12] = snapshot.finalized_block - 40;
+        snapshot.weights_rate_limit = 100;
+        let burner = FakeBurner::new(&snapshot.hotkeys[12], false);
+        let mut chain = FixedChain {
+            snapshot,
+            netuids: RefCell::new(vec![]),
+        };
+        let store = StateStore::new(temp.path().join("state.json"));
+        let log = Log::default();
+        let records = log
+            .capture(|| run_once(&run(&chain, &store, &burner)))
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(burner.calls.borrow().is_empty());
+        assert_eq!(store.load().unwrap().burn_epoch_end_block, None);
+        assert_eq!(
+            log.messages().last().unwrap(),
+            "Weights rate-limited last_update=682 limit=100 allowed_from_block=782 finalized_block=722"
+        );
+
+        // Once the head passes the allowed block, the same summary is submitted.
+        chain.snapshot.finalized_block = 782;
+        let records = run_once(&run(&chain, &store, &burner)).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(*burner.calls.borrow(), [(46, 782)]);
+        assert_eq!(store.load().unwrap().burn_epoch_end_block, Some(720));
+    }
+
+    #[test]
+    fn rate_limit_is_inert_at_zero_and_for_a_validator_that_never_set_weights() {
+        let mut snapshot = fixture_snapshot();
+        assert_eq!(rate_limited(&snapshot, 12), None);
+        snapshot.weights_rate_limit = 100;
+        assert_eq!(rate_limited(&snapshot, 12), None, "never set weights");
+        snapshot.last_updates[12] = snapshot.finalized_block;
+        assert_eq!(
+            rate_limited(&snapshot, 12),
+            Some(snapshot.finalized_block + 100)
+        );
+        snapshot.weights_rate_limit = 0;
+        assert_eq!(rate_limited(&snapshot, 12), None, "limit 0");
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub struct ChainSnapshot {
     pub last_step: u64,
     pub hotkeys: Vec<String>,
     pub last_updates: Vec<u64>,
+    /// `WeightsSetRateLimit`: the blocks a validator must wait between weight sets; 0 on
+    /// a localnet that steps every tempo. Absent from older test snapshots, where it is 0.
+    #[cfg_attr(test, serde(default))]
+    pub weights_rate_limit: u64,
 }
 
 /// Finalized chain state is unavailable or inconsistent.
@@ -225,6 +229,15 @@ impl BittensorChain {
             .map_err(lookup)?
             .decode()
             .map_err(lookup)?;
+        let weights_rate_limit: u64 = storage
+            .fetch(
+                dynamic::storage::<(u16,), u64>("SubtensorModule", "WeightsSetRateLimit"),
+                (netuid,),
+            )
+            .await
+            .map_err(lookup)?
+            .decode()
+            .map_err(lookup)?;
         // The roster is paged in as one map; a UID without an entry is `KeyError: {uid}`,
         // the lowest one first.
         let mut roster = HashMap::new();
@@ -262,6 +275,7 @@ impl BittensorChain {
             last_step,
             hotkeys,
             last_updates,
+            weights_rate_limit,
         })
     }
 }
@@ -295,6 +309,7 @@ pub(crate) mod tests {
             last_step: epoch_summary.epoch_end_block,
             last_updates: vec![0; hotkeys.len()],
             hotkeys,
+            weights_rate_limit: 0,
         }
     }
 

@@ -84,6 +84,8 @@ fn bittensor_adapter_reads_finalized_storage() {
             last_step: expected["LastMechansimStepBlock"].as_u64().unwrap(),
             hotkeys,
             last_updates,
+            // The cassette records no entry for netuid 46, so the runtime default applies.
+            weights_rate_limit: 100,
         }
     );
     assert_eq!(
