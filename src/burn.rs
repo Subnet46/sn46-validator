@@ -147,6 +147,12 @@ impl EpochEconomics {
 
     /// The largest whole-percent burn that still leaves the miners at least the target;
     /// NONE when their whole share is worth no more than it.
+    ///
+    /// Zero chain values, as a fresh localnet may hold them: no `alpha_out_emission` or
+    /// no `subnet_tao` values the miners' share at nothing, which is at most any target,
+    /// so the burn is NONE and every scored miner keeps its weight; no `subnet_alpha_in`
+    /// leaves the price undefined, which is an error, so no weights are set that run and
+    /// the next poll retries.
     pub fn burn_for_target(
         &self,
         miner_target_usd_cents: u64,
@@ -195,6 +201,15 @@ pub fn weights(
         .map(|(uid, share)| (uid, ((share * MAX_WEIGHT + highest / 2) / highest) as u16))
         .filter(|(_, weight)| *weight > 0)
         .unzip())
+}
+
+/// The one line that records what goes on chain: the owner UID, the burn in basis points
+/// and the `(dests, weights)` vector as submitted.
+pub fn weights_line(owner_uid: u16, burn: BurnFraction, dests: &[u16], weights: &[u16]) -> String {
+    format!(
+        "Weights prepared owner_uid={owner_uid} burn_bps={} dests={dests:?} weights={weights:?}",
+        burn.0
+    )
 }
 
 fn refuse<T>(message: impl Into<String>) -> Result<T, BurnError> {
@@ -439,6 +454,7 @@ impl<'a> BittensorBurnWriter<'a> {
             }
         };
         let (dests, weights) = weights(miners, uid, burn)?;
+        tracing::info!("{}", weights_line(uid, burn, &dests, &weights));
 
         // Use a pool-aware nonce, but a mortal era so an uncertain transaction cannot
         // execute indefinitely after our watch times out.
@@ -601,6 +617,21 @@ mod tests {
         assert_eq!(
             weights(&[], OWNER, BurnFraction::NONE).unwrap(),
             owner_alone
+        );
+    }
+
+    #[test]
+    fn the_weights_line_shows_the_vector_as_submitted() {
+        let (dests, weights) = weights(&scored(), OWNER, BurnFraction(5_000)).unwrap();
+        assert_eq!(
+            weights_line(OWNER, BurnFraction(5_000), &dests, &weights),
+            format!(
+                "Weights prepared owner_uid=238 burn_bps=5000 dests={dests:?} weights={weights:?}"
+            )
+        );
+        assert_eq!(
+            weights_line(3, BurnFraction::FULL, &[3], &[65_535]),
+            "Weights prepared owner_uid=3 burn_bps=10000 dests=[3] weights=[65535]"
         );
     }
 
