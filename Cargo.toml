@@ -9,11 +9,12 @@ members = ["subtensor"]
 exclude = ["fuzz"]
 
 [dependencies]
-sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "2587d615219cfa825cfc7c7fa9b585c7056864ba" }
+sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "26487e1b525ed36505628abe60120941226af24f" }
 ark-serialize = "0.4.2"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 hex = "0.4.3"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+schnorrkel = { version = "0.11.5", default-features = false, features = ["std"] }
 sha2 = "0.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }

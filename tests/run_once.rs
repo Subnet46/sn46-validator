@@ -15,7 +15,7 @@ use support::Node;
 use support::fake_node::{Cassette, FakeNode};
 
 const CASSETTE: &str = "finney_46_9036625.json";
-const FIXTURE: &str = include_str!("fixtures/epoch_summary_v2.json");
+const FIXTURE: &str = include_str!("fixtures/epoch_summary_v3.json");
 const SIGNER: &str = "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy";
 const DEVELOPMENT_HOTKEY: &str = "5FnoWRL4FYzd29q8zXoY3JWio9PtBPgrAFu2RcgQazRQsiCs";
 const FINALIZED: u64 = 722;
@@ -66,6 +66,15 @@ fn epoch() -> Node {
     epoch.set_subtensor("LastMechansimStepBlock", vec![], 720u64);
     epoch.set_subtensor("BlocksSinceLastStep", vec![], 2u64);
     epoch.set_subtensor("LastUpdate", vec![], vec![0u64; 56]);
+    // Subnet 46's economics on 2026-09-28, which the summary's $100 target prices at 37%.
+    epoch.set_subtensor("SubnetAlphaOutEmission", vec![], 1_000_000_000u64);
+    epoch.set_subtensor("SubnetTAO", vec![], 8_515_450_000_000u64);
+    epoch.set_subtensor("SubnetAlphaIn", vec![], 2_378_997_012_605_306u64);
+    let owner_cut = epoch.storage_key("SubtensorModule", "SubnetOwnerCut", vec![]);
+    epoch.cassette.set_storage(
+        &owner_cut,
+        json!(format!("0x{}", hex::encode(11_796u16.to_le_bytes()))),
+    );
     let epoch_summary: Json = serde_json::from_str(FIXTURE).unwrap();
     for row in epoch_summary["miners"].as_array().unwrap() {
         let (key, _) =
@@ -281,10 +290,15 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
     epoch.set_events(true);
     let burned = run_once(&env);
     assert_eq!(burned.code, 0, "{}", burned.stderr);
+    // The summary's $100 target, priced from the chain, burns 37%.
     assert_eq!(
         burned.messages(),
         [
             "Summary already processed summary_id=local-46-361-720",
+            "Burn priced burn_bps=3700 miners_tao_rao=528326614 miner_target_usd_cents=10000 \
+             tao_price_usd_cents=30160 alpha_out_emission=1000000000 tempo=360 owner_cut=11796 \
+             subnet_tao=8515450000000 subnet_alpha_in=2378997012605306",
+            "Weights prepared owner_uid=238 burn_bps=3700 dests=[12, 37, 238] weights=[65535, 30287, 56276]",
             "✅ Weight submission finalized epoch_end_block=720 result=finalized",
         ]
     );
