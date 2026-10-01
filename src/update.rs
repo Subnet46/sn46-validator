@@ -6,7 +6,8 @@
 //! a release only when the signature verifies against the compiled-in key, its sequence is
 //! newer than the installed one, its apply-after time plus this host's spread has passed and
 //! the host is inside its maintenance window. It keeps the previous binary, restarts the
-//! service and rolls back if the service does not stay up.
+//! service and rolls back if the service does not stay up. A run interrupted between the swap
+//! and the health check is finished by the next one.
 //!
 //! Its state lives in its own root-owned directory, never the validator's `StateDirectory`,
 //! which the unprivileged service user owns.
@@ -64,6 +65,10 @@ pub enum UpdateError {
     },
     #[error("Release {version} failed its health check ({reason}); rolled back")]
     RolledBack { version: String, reason: String },
+    #[error(
+        "Release {version} failed its health check ({reason}); rollback incomplete, retried next run"
+    )]
+    RollbackIncomplete { version: String, reason: String },
     #[error("Update I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -303,6 +308,16 @@ pub struct Installed {
     pub sequence: u64,
 }
 
+/// What `pending.json` records from just before the swap until the release is recorded or
+/// the previous binary is back and running, so an interrupted run is finished by the next.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Pending {
+    version: String,
+    sequence: u64,
+    #[serde(default)]
+    rolling_back: bool,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct FailedReleases {
     failed: Vec<FailedRelease>,
@@ -361,6 +376,30 @@ pub fn run(config: &Config, now_ms: u64) -> Result<Outcome, UpdateError> {
         }
     }
 
+    let pending_path = config.state_dir.join("pending.json");
+    if let Some(pending) = read_json::<Pending>(&pending_path)? {
+        // `.previous` exists before `pending.json` is written and only a rollback moves it
+        // away, so its absence while the old version runs means a rollback restored it even
+        // if it could not mark that in `pending.json`.
+        let restored = pending.version != config.running_version
+            && !previous_path(&config.install_path).exists();
+        if pending.rolling_back || restored {
+            tracing::warn!("Finishing the interrupted rollback of {}", pending.version);
+            let reason = "an earlier rollback was interrupted".into();
+            return Err(roll_back(config, &pending, now_ms, reason));
+        }
+        if pending.version == config.running_version {
+            tracing::warn!(
+                "Finishing the interrupted update to {} (sequence {})",
+                pending.version,
+                pending.sequence
+            );
+            return confirm(config, &pending, now_ms);
+        }
+        // The swap never landed.
+        fs::remove_file(&pending_path)?;
+    }
+
     let installed: Installed =
         read_json(&config.state_dir.join("release.json"))?.unwrap_or_default();
     let Some(raw) = fetch(&config.manifest_url, MAX_MANIFEST_BYTES)? else {
@@ -391,8 +430,8 @@ pub fn run(config: &Config, now_ms: u64) -> Result<Outcome, UpdateError> {
         tracing::info!("Skipped: already running {version}; recorded sequence {sequence}");
         return Ok(Outcome::AlreadyRunning);
     }
-    let failed_path = config.state_dir.join("update-failed.json");
-    let mut failed: FailedReleases = read_json(&failed_path)?.unwrap_or_default();
+    let failed: FailedReleases =
+        read_json(&config.state_dir.join("update-failed.json"))?.unwrap_or_default();
     if failed.failed.iter().any(|f| f.sequence == sequence) {
         tracing::info!(
             "Skipped: release {version} sequence {sequence} failed here before and is not retried"
@@ -441,60 +480,131 @@ pub fn run(config: &Config, now_ms: u64) -> Result<Outcome, UpdateError> {
     }
     check_disk(config, install_dir, &manifest)?;
     let staged = install_dir.join(".sn46-validator.new");
-    let failed_release = |failed: &mut FailedReleases| -> Result<(), UpdateError> {
-        failed.failed.push(FailedRelease {
-            sequence,
-            version: version.clone(),
-            failed_ms: now_ms,
-        });
-        write_json(&failed_path, failed)
-    };
     if let Err(error) = stage(config, &manifest, &staged) {
         let _ = fs::remove_file(&staged);
         if matches!(error, UpdateError::BadRelease(_)) {
-            failed_release(&mut failed)?;
+            record_failure(config, version, sequence, now_ms)?;
         }
         return Err(error);
     }
 
+    // `.previous` must be durable before `pending.json` names the release: recovery reads
+    // its absence as "a rollback already restored it".
     let previous = previous_path(&config.install_path);
-    if let Err(error) = fs::copy(&config.install_path, &previous)
-        .and_then(|_| fs::rename(&staged, &config.install_path))
+    if let Err(error) =
+        fs::copy(&config.install_path, &previous).and_then(|_| File::open(&previous)?.sync_all())
     {
         let _ = fs::remove_file(&staged);
         return Err(error.into());
     }
     sync_dir(install_dir);
+    let pending = Pending {
+        version: version.clone(),
+        sequence,
+        rolling_back: false,
+    };
+    if let Err(error) = write_json(&pending_path, &pending) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&staged, &config.install_path) {
+        let _ = fs::remove_file(&staged);
+        let _ = fs::remove_file(&pending_path);
+        return Err(error.into());
+    }
+    sync_dir(install_dir);
     tracing::info!("Installed {version}; restarting {SERVICE}");
+    confirm(config, &pending, now_ms)
+}
 
+/// With the pending release swapped in: restart the service, then record the release, or
+/// put the previous binary back and never retry it.
+fn confirm(config: &Config, pending: &Pending, now_ms: u64) -> Result<Outcome, UpdateError> {
+    let (version, sequence) = (&pending.version, pending.sequence);
+    let pending_path = config.state_dir.join("pending.json");
     match restart_and_check(config) {
         Ok(()) => {
             write_json(
                 &config.state_dir.join("release.json"),
                 &Installed {
-                    version: version.clone(),
+                    version: version.into(),
                     sequence,
                 },
             )?;
+            fs::remove_file(&pending_path)?;
             tracing::info!("✅ Updated to {version} (sequence {sequence}); {SERVICE} is healthy");
             Ok(Outcome::Updated {
-                version: version.clone(),
+                version: version.into(),
             })
         }
         Err(reason) => {
             tracing::error!("❌ {version} failed its health check: {reason}; rolling back");
-            fs::rename(&previous, &config.install_path)?;
-            sync_dir(install_dir);
-            if let Err(error) = systemctl(config, &["restart", SERVICE]) {
-                tracing::error!("Restart after rollback failed: {error}");
-            }
-            failed_release(&mut failed)?;
-            Err(UpdateError::RolledBack {
-                version: version.clone(),
-                reason,
-            })
+            Err(roll_back(config, pending, now_ms, reason))
         }
     }
+}
+
+/// Put the previous binary back and restart it. Bookkeeping failures are logged, never
+/// allowed to stop the restore; `pending.json` stays, marked as a rollback, until the
+/// previous version restarts and the failed sequence is recorded, so a later run finishes
+/// an incomplete one instead of reinstalling the bad release.
+fn roll_back(config: &Config, pending: &Pending, now_ms: u64, reason: String) -> UpdateError {
+    let version = pending.version.clone();
+    let pending_path = config.state_dir.join("pending.json");
+    let marker = Pending {
+        rolling_back: true,
+        ..pending.clone()
+    };
+    if let Err(error) = write_json(&pending_path, &marker) {
+        tracing::error!("Cannot mark the rollback of {version} in progress: {error}");
+    }
+    let recorded = record_failure(config, &version, pending.sequence, now_ms)
+        .inspect_err(|error| tracing::error!("Cannot record {version} as failed: {error}"))
+        .is_ok();
+    let previous = previous_path(&config.install_path);
+    // Already gone when an earlier, interrupted rollback restored it.
+    if previous.exists() {
+        if let Err(error) = fs::rename(&previous, &config.install_path) {
+            tracing::error!("Cannot restore the previous binary: {error}");
+            return UpdateError::RollbackIncomplete { version, reason };
+        }
+        if let Some(dir) = config.install_path.parent() {
+            sync_dir(dir);
+        }
+    }
+    if let Err(error) = systemctl(config, &["restart", SERVICE]) {
+        tracing::error!("Restart after rollback failed: {error}; the next run retries it");
+        return UpdateError::RollbackIncomplete { version, reason };
+    }
+    if !recorded {
+        return UpdateError::RollbackIncomplete { version, reason };
+    }
+    if let Err(error) = fs::remove_file(&pending_path)
+        && error.kind() != ErrorKind::NotFound
+    {
+        tracing::error!("Cannot clear {}: {error}", pending_path.display());
+    }
+    UpdateError::RolledBack { version, reason }
+}
+
+/// Never retry `sequence` here. Recording it twice is a no-op.
+fn record_failure(
+    config: &Config,
+    version: &str,
+    sequence: u64,
+    now_ms: u64,
+) -> Result<(), UpdateError> {
+    let path = config.state_dir.join("update-failed.json");
+    let mut failed: FailedReleases = read_json(&path)?.unwrap_or_default();
+    if failed.failed.iter().any(|f| f.sequence == sequence) {
+        return Ok(());
+    }
+    failed.failed.push(FailedRelease {
+        sequence,
+        version: version.into(),
+        failed_ms: now_ms,
+    });
+    write_json(&path, &failed)
 }
 
 /// The updater runs as root and writes here, so only its own user may be able to.

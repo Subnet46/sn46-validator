@@ -181,6 +181,7 @@ fn end_to_end_update_swaps_keeps_previous_and_records_the_release() {
         host.installed(),
         Some(json!({"sequence": 2, "version": "0.1.4"}))
     );
+    assert!(!host.path("state/pending.json").exists());
     let log = host.systemctl_log();
     assert!(log.starts_with("restart sn46-validator\n"), "{log}");
     assert!(log.contains("show -p ActiveState,NRestarts sn46-validator\n"));
@@ -367,6 +368,240 @@ fn a_service_that_is_not_active_is_rolled_back() {
         UpdateError::RolledBack { .. }
     ));
     host.assert_installed("0.1.3");
+}
+
+/// The state a run killed between the swap and the health check leaves behind, as seen by
+/// the next run, which is the new binary.
+fn interrupted_after_the_swap(host: &mut Host) {
+    host.publish("0.1.4", 2, 0);
+    fs::rename(
+        host.path("bin/sn46-validator"),
+        host.path("bin/sn46-validator.previous"),
+    )
+    .unwrap();
+    fs::write(host.path("bin/sn46-validator"), fake_binary("0.1.4")).unwrap();
+    fs::write(
+        host.path("state/pending.json"),
+        r#"{"sequence":2,"version":"0.1.4"}"#,
+    )
+    .unwrap();
+    host.config.running_version = "0.1.4".into();
+}
+
+#[test]
+fn an_interrupted_update_is_health_checked_before_it_is_recorded() {
+    let mut host = Host::new("0");
+    interrupted_after_the_swap(&mut host);
+    assert_eq!(
+        run(&host.config, NOW).unwrap(),
+        Outcome::Updated {
+            version: "0.1.4".into()
+        }
+    );
+    assert!(host.systemctl_log().starts_with("restart sn46-validator\n"));
+    assert_eq!(
+        host.installed(),
+        Some(json!({"sequence": 2, "version": "0.1.4"}))
+    );
+    assert!(!host.path("state/pending.json").exists());
+    assert_eq!(run(&host.config, NOW).unwrap(), Outcome::NotNewer);
+}
+
+#[test]
+fn an_interrupted_unhealthy_update_is_rolled_back() {
+    let mut host = Host::new("n");
+    host.config.health = Duration::from_millis(100);
+    interrupted_after_the_swap(&mut host);
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RolledBack { .. }
+    ));
+    host.assert_installed("0.1.3");
+    assert_eq!(host.installed(), None);
+    assert!(!host.path("state/pending.json").exists());
+    assert_eq!(
+        host.json("state/update-failed.json").unwrap()["failed"][0]["sequence"],
+        2
+    );
+}
+
+#[test]
+fn a_failure_that_cannot_be_recorded_still_rolls_back() {
+    let mut host = Host::new("n");
+    host.config.health = Duration::from_millis(100);
+    host.publish("0.1.4", 2, 0);
+    // Writing the failure record now fails.
+    fs::create_dir(host.path("state/update-failed.json.tmp")).unwrap();
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RollbackIncomplete { .. }
+    ));
+    host.assert_installed("0.1.3");
+    assert_eq!(host.systemctl_log().matches("restart").count(), 2);
+    // The marker is the only evidence 0.1.4 failed: it stays until the failure is recorded,
+    // and the release is not installed again meanwhile.
+    assert_eq!(
+        host.json("state/pending.json").unwrap()["rolling_back"],
+        true
+    );
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RollbackIncomplete { .. }
+    ));
+    host.assert_installed("0.1.3");
+    fs::remove_dir(host.path("state/update-failed.json.tmp")).unwrap();
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RolledBack { .. }
+    ));
+    assert!(!host.path("state/pending.json").exists());
+    assert_eq!(
+        host.json("state/update-failed.json").unwrap()["failed"][0]["sequence"],
+        2
+    );
+    assert_eq!(run(&host.config, NOW).unwrap(), Outcome::PreviouslyFailed);
+    host.assert_installed("0.1.3");
+}
+
+#[test]
+fn a_rollback_whose_restart_fails_is_finished_by_the_next_run() {
+    let mut host = Host::new("n");
+    host.config.health = Duration::from_millis(100);
+    // Unhealthy after the first restart; every later restart fails while `fail` exists.
+    script(
+        &host.path("systemctl"),
+        &format!(
+            "log={log}\necho \"$*\" >> \"$log\"\n             case \"$1\" in\n  restart) [ \"$(grep -c '^restart' \"$log\")\" -ge 2 ] && [ -e {fail} ] && exit 1; exit 0;;\n               show) n=$(grep -c '^show' \"$log\"); echo ActiveState=active; echo NRestarts=$n;;\nesac\n",
+            log = host.path("systemctl.log").display(),
+            fail = host.path("fail").display(),
+        ),
+    );
+    fs::write(host.path("fail"), "").unwrap();
+    host.publish("0.1.4", 2, 0);
+    let error = run(&host.config, NOW).unwrap_err();
+    assert!(
+        matches!(error, UpdateError::RollbackIncomplete { .. }),
+        "{error}"
+    );
+    host.assert_installed("0.1.3");
+    assert_eq!(
+        host.json("state/pending.json").unwrap()["rolling_back"],
+        true
+    );
+    // Still failing: the marker survives another attempt.
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RollbackIncomplete { .. }
+    ));
+    fs::remove_file(host.path("fail")).unwrap();
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RolledBack { .. }
+    ));
+    assert!(!host.path("state/pending.json").exists());
+    host.assert_installed("0.1.3");
+    let failed = host.json("state/update-failed.json").unwrap();
+    assert_eq!(failed["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(run(&host.config, NOW).unwrap(), Outcome::PreviouslyFailed);
+}
+
+#[test]
+fn a_rollback_interrupted_after_the_restore_restarts_the_service() {
+    let host = Host::new("0");
+    host.publish("0.1.4", 2, 0);
+    fs::write(
+        host.path("state/pending.json"),
+        r#"{"rolling_back":true,"sequence":2,"version":"0.1.4"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RolledBack { .. }
+    ));
+    assert_eq!(host.systemctl_log(), "restart sn46-validator\n");
+    host.assert_installed("0.1.3");
+    assert!(!host.path("state/pending.json").exists());
+    assert_eq!(run(&host.config, NOW).unwrap(), Outcome::PreviouslyFailed);
+}
+
+#[test]
+fn a_rollback_that_could_not_write_any_state_is_still_recognised() {
+    let host = Host::new("0");
+    host.publish("0.1.4", 2, 0);
+    // The rollback restored 0.1.3 (no `.previous` left) but could neither mark
+    // `pending.json` nor record the failure.
+    fs::write(
+        host.path("state/pending.json"),
+        r#"{"rolling_back":false,"sequence":2,"version":"0.1.4"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RolledBack { .. }
+    ));
+    host.assert_installed("0.1.3");
+    assert!(!host.path("state/pending.json").exists());
+    assert_eq!(
+        host.json("state/update-failed.json").unwrap()["failed"][0]["sequence"],
+        2
+    );
+    assert_eq!(run(&host.config, NOW).unwrap(), Outcome::PreviouslyFailed);
+    host.assert_installed("0.1.3");
+}
+
+#[test]
+fn a_state_dir_that_turns_read_only_after_the_swap_loses_no_failure() {
+    let mut host = Host::new("n");
+    host.config.health = Duration::from_millis(100);
+    // The first restart (of the new release) makes the state directory read-only.
+    script(
+        &host.path("systemctl"),
+        &format!(
+            "log={log}\necho \"$*\" >> \"$log\"\n\
+             case \"$1\" in\n  restart) [ \"$(grep -c '^restart' \"$log\")\" = 1 ] && chmod 0500 {state}; exit 0;;\n  \
+             show) n=$(grep -c '^show' \"$log\"); echo ActiveState=active; echo NRestarts=$n;;\nesac\n",
+            log = host.path("systemctl.log").display(),
+            state = host.path("state").display(),
+        ),
+    );
+    host.publish("0.1.4", 2, 0);
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RollbackIncomplete { .. }
+    ));
+    host.assert_installed("0.1.3");
+    assert_eq!(
+        host.json("state/pending.json").unwrap()["rolling_back"],
+        false
+    );
+    fs::set_permissions(host.path("state"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        run(&host.config, NOW).unwrap_err(),
+        UpdateError::RolledBack { .. }
+    ));
+    assert_eq!(run(&host.config, NOW).unwrap(), Outcome::PreviouslyFailed);
+    host.assert_installed("0.1.3");
+}
+
+#[test]
+fn a_pending_update_that_never_landed_is_dropped() {
+    let host = Host::new("0");
+    host.publish("0.1.4", 2, 0);
+    fs::copy(
+        host.path("bin/sn46-validator"),
+        host.path("bin/sn46-validator.previous"),
+    )
+    .unwrap();
+    fs::write(
+        host.path("state/pending.json"),
+        r#"{"sequence":2,"version":"0.1.4"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        run(&host.config, NOW).unwrap(),
+        Outcome::Updated { .. }
+    ));
+    assert!(!host.path("state/pending.json").exists());
 }
 
 #[test]

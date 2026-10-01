@@ -36,7 +36,7 @@ AUTO_UPDATE=0                 # turn automatic updates off
 UPDATE_WINDOW="02:00-05:00"   # only update in this window; may wrap midnight, e.g. 22:00-02:00
 ```
 
-An update downloads the binary next to the installed one, checks its size, SHA-256 and `--version`, keeps the old binary as `/usr/local/bin/sn46-validator.previous`, swaps it in and restarts the service. If the service is not active or restarts on its own within 30 seconds, the updater puts the old binary back, restarts it, and never retries that release (a newer one is tried as usual). If the disk lacks room for three copies of the binary, the update is skipped with a warning and `/var/lib/sn46-validator-update/update-status.json` says how much space is needed.
+An update downloads the binary next to the installed one, checks its size, SHA-256 and `--version`, keeps the old binary as `/usr/local/bin/sn46-validator.previous`, swaps it in and restarts the service. If the service is not active or restarts on its own within 30 seconds, the updater puts the old binary back, restarts it, and never retries that release (a newer one is tried as usual). If the updater is interrupted after the swap, its next run finishes the health check first. If the disk lacks room for three copies of the binary, the update is skipped with a warning and `/var/lib/sn46-validator-update/update-status.json` says how much space is needed.
 
 Check it:
 
