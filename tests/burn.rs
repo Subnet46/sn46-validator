@@ -179,7 +179,8 @@ fn writer_submits_the_scored_vector_with_the_burn_share() {
             if bps == 10_000 {
                 1
             } else {
-                2 + usize::from(bps > 0)
+                // All three fixture miners score: uid 55's single failed proof is forgiven.
+                3 + usize::from(bps > 0)
             }
         );
         assert_eq!(submitted_weights(&node), expected, "burn {bps} bps");

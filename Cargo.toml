@@ -1,6 +1,6 @@
 [package]
 name = "sn46-validator"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.91"
 
@@ -9,7 +9,7 @@ members = ["subtensor"]
 exclude = ["fuzz"]
 
 [dependencies]
-sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "26487e1b525ed36505628abe60120941226af24f" }
+sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "e7147c8ac545151a88e61448af83a6a8be89176b" }
 ark-serialize = "0.4.2"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 hex = "0.4.3"

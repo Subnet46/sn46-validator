@@ -366,7 +366,8 @@ pub(crate) mod tests {
         assert_eq!(*chain.netuids.borrow(), [46]);
         let uids: Vec<u64> = records.iter().map(|record| record.miner.uid).collect();
         assert_eq!(uids, [12, 37, 55]);
-        assert_eq!(weights(&records), [65_535, 30_287, 0]);
+        // uid 55 failed one proof of 80, which the scoring forgives.
+        assert_eq!(weights(&records), [65_535, 30_287, 54_409]);
         let messages = log.messages();
         assert_eq!(
             messages
@@ -648,9 +649,9 @@ pub(crate) mod tests {
         let restarted = run_once(&run(&chain, &second_store, &burner)).unwrap();
         assert_eq!(first, late);
         assert!(restarted.is_empty());
-        assert_eq!(weights(&first), [65_535, 30_287, 0]);
-        assert_eq!(first[2].score_bps, 0);
-        assert!(first[2].disqualified);
+        assert_eq!(weights(&first), [65_535, 30_287, 54_409]);
+        assert_eq!(first[2].score_bps, 8_294);
+        assert!(!first[2].disqualified);
     }
 
     #[test]
@@ -713,5 +714,48 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// Rewrite the log lines of `tests/golden/runtime_cases.json` from the current code,
+    /// keeping every other field. Run after a scoring change with
+    /// `cargo test regenerate_runtime_cases -- --ignored`, then review the diff.
+    #[test]
+    #[ignore = "rewrites the golden file"]
+    fn regenerate_runtime_cases() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/runtime_cases.json"
+        );
+        let mut cases: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for case in cases.as_array_mut().unwrap() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = StateStore::new(temp.path().join("state.json"));
+            for run_case in case["runs"].as_array_mut().unwrap() {
+                if let Some(before) = run_case["state_before"].as_object() {
+                    store
+                        .save(&ValidatorState {
+                            summary_id: before["summary_id"].as_str().map(str::to_owned),
+                            summary_digest: before["summary_digest"].as_str().map(str::to_owned),
+                            summary_epoch_end_block: before["summary_epoch_end_block"].as_u64(),
+                            burn_epoch_end_block: before["burn_epoch_end_block"].as_u64(),
+                        })
+                        .unwrap();
+                }
+                let spec = &run_case["burner"];
+                let burner = FakeBurner::new(
+                    spec["hotkey"].as_str().unwrap(),
+                    spec["fail"].as_bool().unwrap(),
+                );
+                let chain = FixedChain {
+                    snapshot: snapshot_of(&run_case["snapshot"]),
+                    netuids: RefCell::new(vec![]),
+                };
+                let log = Log::default();
+                let _ = log.capture(|| run_once(&run(&chain, &store, &burner)));
+                run_case["messages"] = json!(log.messages());
+            }
+        }
+        std::fs::write(path, serde_json::to_string(&cases).unwrap() + "\n").unwrap();
     }
 }
