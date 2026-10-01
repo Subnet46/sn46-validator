@@ -298,7 +298,7 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
             "Burn priced burn_bps=3700 miners_tao_rao=528326614 miner_target_usd_cents=10000 \
              tao_price_usd_cents=30160 alpha_out_emission=1000000000 tempo=360 owner_cut=11796 \
              subnet_tao=8515450000000 subnet_alpha_in=2378997012605306",
-            "Weights prepared owner_uid=238 burn_bps=3700 dests=[12, 37, 238] weights=[65535, 30287, 56276]",
+            "Weights prepared owner_uid=238 burn_bps=3700 dests=[12, 37, 55, 238] weights=[48677, 22496, 40413, 65535]",
             "✅ Weight submission finalized epoch_end_block=720 result=finalized",
         ]
     );

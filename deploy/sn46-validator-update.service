@@ -1,0 +1,18 @@
+[Unit]
+Description=SN46 validator signed auto-update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/sn46-validator/config
+ExecStart=/usr/local/bin/sn46-validator update
+TimeoutStartSec=15min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/usr/local/bin
+StateDirectory=sn46-validator-update
+StateDirectoryMode=0700
+PrivateTmp=true

@@ -10,6 +10,7 @@ use sn46_validator::burn::BittensorBurnWriter;
 use sn46_validator::chain::BittensorChain;
 use sn46_validator::runtime::{Run, RunError, fetch_epoch_summary, next_delay, run_once};
 use sn46_validator::state::StateStore;
+use sn46_validator::update;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
@@ -24,6 +25,9 @@ struct Cli {
     /// Run continuously, or process one summary and exit.
     #[arg(value_enum, default_value = "run")]
     command: Command,
+    /// With `update`: ignore the release's apply-after time and UPDATE_WINDOW.
+    #[arg(long)]
+    now: bool,
     #[command(flatten)]
     options: Options,
 }
@@ -35,6 +39,8 @@ enum Command {
     Run,
     /// Process the current summary and exit.
     RunOnce,
+    /// Install the latest signed release if it is due (run as root by the update timer).
+    Update,
 }
 
 #[derive(Args)]
@@ -218,6 +224,29 @@ fn log_time(writer: &mut Writer<'_>) -> std::fmt::Result {
     )
 }
 
+fn update(now: bool, options: &Options) -> ExitCode {
+    let hotkey_file = expand_user(options.wallet_path.clone())
+        .join(&options.wallet_name)
+        .join("hotkeys")
+        .join(&options.wallet_hotkey);
+    let outcome =
+        update::Config::from_lookup(|key| std::env::var(key).ok(), now, Some(&hotkey_file))
+            .and_then(|config| {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                update::run(&config, now_ms)
+            });
+    match outcome {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(error = %error, "❌ Update failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let filter = EnvFilter::try_new(&cli.options.log).unwrap_or_else(|_| EnvFilter::new("info"));
@@ -228,6 +257,12 @@ fn main() -> ExitCode {
         .with_timer(log_time as fn(&mut Writer<'_>) -> std::fmt::Result)
         .with_ansi(std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
         .init();
+    if cli.now && !matches!(cli.command, Command::Update) {
+        configuration_error("--now applies only to update").exit();
+    }
+    if matches!(cli.command, Command::Update) {
+        return update(cli.now, &cli.options);
+    }
     let config = Config::from_options(cli.options).unwrap_or_else(|error| error.exit());
     let mode = if matches!(cli.command, Command::RunOnce) {
         "run-once"
@@ -280,5 +315,13 @@ mod tests {
         assert!(config.endpoint.is_empty());
         assert_eq!(config.epoch_summary_url, PLATFORM_URL);
         assert_eq!(config.platform_signer, PLATFORM_SIGNER);
+    }
+
+    #[test]
+    fn update_takes_an_optional_now_flag() {
+        let cli = Cli::try_parse_from(["sn46-validator", "update", "--now"]).unwrap();
+        assert!(matches!(cli.command, Command::Update) && cli.now);
+        let cli = Cli::try_parse_from(["sn46-validator", "update"]).unwrap();
+        assert!(!cli.now);
     }
 }
