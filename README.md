@@ -21,6 +21,34 @@ curl -fsSL https://raw.githubusercontent.com/Subnet46/sn46-validator/main/instal
 
 Select your wallet when prompted. The installer starts the validator as a systemd service and enables it after reboot. Upgrades reuse your existing service settings.
 
+## Updates
+
+Service installs update themselves. A systemd timer (`sn46-validator-update.timer`, every 15 minutes) runs `sn46-validator update` as root, which installs the latest release only when:
+
+- its `manifest.json` is signed with the validator release key built into the binary (the miner key is never accepted), and its sequence is newer than the one in `/var/lib/sn46-validator-update/release.json`, so an old release can never be replayed;
+- the release's apply-after time plus this host's spread has passed. The spread is a fixed delay of up to 2 hours (`UPDATE_SPREAD_S`, default 7200) derived from your hotkey, so validators do not all restart at once;
+- the time is inside your maintenance window, if you set one.
+
+Settings go in `/etc/sn46-validator/config` (times are UTC):
+
+```bash
+AUTO_UPDATE=0                 # turn automatic updates off
+UPDATE_WINDOW="02:00-05:00"   # only update in this window; may wrap midnight, e.g. 22:00-02:00
+```
+
+An update downloads the binary next to the installed one, checks its size, SHA-256 and `--version`, keeps the old binary as `/usr/local/bin/sn46-validator.previous`, swaps it in and restarts the service. If the service is not active or restarts on its own within 30 seconds, the updater puts the old binary back, restarts it, and never retries that release (a newer one is tried as usual). If the disk lacks room for three copies of the binary, the update is skipped with a warning and `/var/lib/sn46-validator-update/update-status.json` says how much space is needed.
+
+Check it:
+
+```bash
+systemctl list-timers sn46-validator-update.timer
+sudo journalctl -u sn46-validator-update
+sudo systemctl start sn46-validator-update     # check now (still honours the schedule)
+sudo sn46-validator update --now               # install a due release now, ignoring apply-after and the window
+```
+
+Every run logs why it did or did not update. Hosts installed with v0.1.2 or earlier have no timer: run the installer once more to get it.
+
 ## Logs
 
 ```bash

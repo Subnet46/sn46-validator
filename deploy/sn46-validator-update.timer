@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for signed SN46 validator releases
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
