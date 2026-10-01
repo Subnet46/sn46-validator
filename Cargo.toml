@@ -12,7 +12,9 @@ exclude = ["fuzz"]
 sn46-shared = { git = "https://github.com/Subnet46/sn46-shared", rev = "e7147c8ac545151a88e61448af83a6a8be89176b" }
 ark-serialize = "0.4.2"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+ed25519-dalek = "2.2.0"
 hex = "0.4.3"
+libc = "0.2.189"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 schnorrkel = { version = "0.11.5", default-features = false, features = ["std"] }
 sha2 = "0.11.0"

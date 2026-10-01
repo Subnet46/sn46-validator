@@ -48,7 +48,7 @@ pub fn next_delay(outcome: &Result<(), RunError>, poll_interval: Duration) -> Du
 pub fn fetch_epoch_summary(url: &str, timeout: Duration) -> Result<Vec<u8>, RunError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
-        .user_agent("sn46-validator/0.1")
+        .user_agent(concat!("sn46-validator/", env!("CARGO_PKG_VERSION")))
         .http_status_as_error(true)
         .build()
         .new_agent();
