@@ -3,6 +3,8 @@
 
 SN46 validator for Linux x86_64 (Ubuntu 22.04+). Defaults to **Finney mainnet, subnet 46**, with our platform URL and signer built in.
 
+The validator accepts a summary signed by any key in `PLATFORM_SIGNER` (`--platform-signer`), a comma-separated list of SS58 addresses; the log line `Summary verified ... signer=<SS58>` names the key that signed it. To rotate the platform key, a release lists both the old and the new key until the platform has switched; a summary signed by any other key is refused.
+
 
 Follow Instant on X: [@thinkinstant](https://x.com/thinkinstant).
 
