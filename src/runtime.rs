@@ -76,7 +76,8 @@ pub struct Run<'a> {
     pub network: &'a str,
     pub netuid: u64,
     pub epoch_summary_url: &'a str,
-    pub platform_signer: &'a str,
+    /// The platform keys a summary may be signed by (more than one while a key rotates).
+    pub platform_signers: &'a [String],
     pub chain: &'a dyn Chain,
     pub state: &'a StateStore,
     pub burner: &'a dyn Burner,
@@ -99,14 +100,31 @@ fn target_policy(epoch_summary: &EpochSummary) -> Result<BurnPolicy, BurnError> 
     }
 }
 
+/// The summary, verified as signed by one of `signers`: the one its `signer` names. A summary
+/// any other key signed is refused as `Signer`, as with a single trusted key.
+fn parse_signed_summary(
+    raw: &[u8],
+    network: &str,
+    netuid: u64,
+    signers: &[String],
+) -> Result<EpochSummary, EpochSummaryError> {
+    for signer in signers {
+        match parse_epoch_summary(raw, network, netuid, signer) {
+            Err(EpochSummaryError::Signer) => continue,
+            outcome => return outcome,
+        }
+    }
+    Err(EpochSummaryError::Signer)
+}
+
 pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
     let _lock = run.state.lock()?;
     let snapshot = run.chain.snapshot(run.netuid)?;
-    let epoch_summary = parse_epoch_summary(
+    let epoch_summary = parse_signed_summary(
         &(run.fetch)(run.epoch_summary_url, run.timeout)?,
         run.network,
         run.netuid,
-        run.platform_signer,
+        run.platform_signers,
     )?;
     validate_chain(&epoch_summary, &snapshot)?;
     let mut saved = run.state.load()?;
@@ -141,9 +159,10 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         run.state.save(&saved)?;
         log_score_records(&records);
         tracing::info!(
-            "Summary verified summary_id={summary_id} finalized_block={} miners={}",
+            "Summary verified summary_id={summary_id} finalized_block={} miners={} signer={}",
             snapshot.finalized_block,
-            records.len()
+            records.len(),
+            epoch_summary.signer
         );
         records
     };
@@ -325,12 +344,75 @@ pub(crate) mod tests {
         }
     }
 
+    /// The fixture summaries' signer (`//Dave`).
+    const DAVE_SS58: &str = "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy";
+    static DAVE: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| vec![DAVE_SS58.to_owned()]);
+
+    fn ss58_of(uri: &str) -> String {
+        use sn46_shared::identity::{SS58_FORMAT, encode_ss58};
+        use subxt_signer::{SecretUri, sr25519::Keypair};
+        let keypair = Keypair::from_uri(&uri.parse::<SecretUri>().unwrap()).unwrap();
+        encode_ss58(&keypair.public_key().0, SS58_FORMAT)
+    }
+
+    /// While the platform key rotates, a summary signed by either listed key is accepted
+    /// and the log names the one that signed it; a key not on the list is refused.
+    #[test]
+    fn a_summary_signed_by_any_listed_signer_is_accepted_and_named() {
+        let eve = ss58_of("//Eve");
+        for signers in [
+            vec![DAVE_SS58.to_owned(), eve.clone()],
+            vec![eve.clone(), DAVE_SS58.to_owned()],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let chain = FixedChain {
+                snapshot: fixture_snapshot(),
+                netuids: RefCell::new(vec![]),
+            };
+            let store = StateStore::new(temp.path().join("state.json"));
+            let burner = FakeBurner::new(&chain.snapshot.hotkeys[12], false);
+            let mut arguments = run(&chain, &store, &burner);
+            arguments.platform_signers = &signers;
+            let log = Log::default();
+            let records = log.capture(|| run_once(&arguments)).unwrap();
+            assert_eq!(records.len(), 3, "{signers:?}");
+            assert!(
+                log.messages()
+                    .iter()
+                    .any(|line| line.starts_with("Summary verified ")
+                        && line.ends_with(&format!(" signer={DAVE_SS58}"))),
+                "{signers:?}"
+            );
+        }
+        for signers in [vec![eve.clone()], vec![eve, ss58_of("//Ferdie")], vec![]] {
+            let temp = tempfile::tempdir().unwrap();
+            let chain = FixedChain {
+                snapshot: fixture_snapshot(),
+                netuids: RefCell::new(vec![]),
+            };
+            let store = StateStore::new(temp.path().join("state.json"));
+            let burner = FakeBurner::new(&chain.snapshot.hotkeys[12], false);
+            let mut arguments = run(&chain, &store, &burner);
+            arguments.platform_signers = &signers;
+            assert!(
+                matches!(
+                    run_once(&arguments),
+                    Err(RunError::EpochSummary(EpochSummaryError::Signer))
+                ),
+                "{signers:?}"
+            );
+            assert!(burner.calls.borrow().is_empty());
+            assert_eq!(store.load().unwrap().summary_epoch_end_block, None);
+        }
+    }
+
     fn run<'a>(chain: &'a dyn Chain, state: &'a StateStore, burner: &'a dyn Burner) -> Run<'a> {
         Run {
             network: "local",
             netuid: 46,
             epoch_summary_url: "https://platform.invalid/latest",
-            platform_signer: "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy",
+            platform_signers: &DAVE,
             chain,
             state,
             burner,
@@ -378,7 +460,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             messages[messages.len() - 2],
-            "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3"
+            "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3 signer=5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy"
         );
     }
 
