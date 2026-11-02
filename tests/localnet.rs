@@ -138,7 +138,7 @@ async fn localnet_burn_extrinsic_finalizes() {
 async fn localnet_timelocked_burn_writer_finalizes() {
     let (node, rpc) = localnet::Localnet::start().await;
     tokio::time::timeout(Duration::from_secs(180), async {
-        use sn46_validator::burn::{BittensorBurnWriter, BurnFraction, Burner};
+        use sn46_validator::burn::{BittensorBurnWriter, BurnFraction, BurnPolicy, Burner};
         use sn46_validator::chain::BittensorChain;
         let client = support::legacy_client(rpc.clone()).await;
         let alice = subxt_signer::sr25519::dev::alice();
@@ -227,7 +227,12 @@ async fn localnet_timelocked_burn_writer_finalizes() {
             )
             .unwrap();
             let result = writer
-                .submit(netuid as u64, block, &[], BurnFraction::FULL)
+                .submit(
+                    netuid as u64,
+                    block,
+                    &[],
+                    BurnPolicy::Fixed(BurnFraction::FULL),
+                )
                 .unwrap();
             assert_eq!(
                 std::fs::read_to_string(state_path.with_added_extension("submission.json"))

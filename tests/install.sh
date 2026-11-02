@@ -82,6 +82,10 @@ if [[ ${TEST_SYSTEMD:-0} == 1 ]]; then
     unset INSTALL_DIR
     cp "$test_dir/installed" "$MOCK_ASSETS/sn46-validator-linux-x86_64"
     checksum
+    # A signed release carries a manifest; the installer records its sequence.
+    printf '{"apply_after_ms":0,"binary":{"name":"sn46-validator-linux-x86_64","sha256":"%s","size":%s},"schema":"sn46.validator.release.v1","sequence":7,"version":"%s"}\n' \
+        "$(cut -d' ' -f1 "$MOCK_ASSETS/SHA256SUMS")" "$(stat -c %s "$MOCK_ASSETS/sn46-validator-linux-x86_64")" \
+        "${MOCK_VERSION#v}" > "$MOCK_ASSETS/manifest.json"
     mkdir -p /run/systemd/system /root/.bittensor/wallets/validator/hotkeys
     touch /root/.bittensor/wallets/validator/hotkeys/default
     export MOCK_SYSTEMCTL_LOG="$test_dir/systemctl.log"
@@ -107,6 +111,11 @@ SH
     sed '/^User=/d; /^Group=/d' "$repository_dir/deploy/sn46-validator.service" > "$test_dir/expected-unit"
     sed '/^User=/d' /etc/systemd/system/sn46-validator.service > "$test_dir/actual-unit"
     cmp "$test_dir/expected-unit" "$test_dir/actual-unit"
+    # The update timer is installed from the deploy units and enabled.
+    cmp "$repository_dir/deploy/sn46-validator-update.service" /etc/systemd/system/sn46-validator-update.service
+    cmp "$repository_dir/deploy/sn46-validator-update.timer" /etc/systemd/system/sn46-validator-update.timer
+    grep -Fx 'enable --now sn46-validator-update.timer' "$MOCK_SYSTEMCTL_LOG"
+    [[ $(cat /var/lib/sn46-validator-update/release.json) == "{\"sequence\":7,\"version\":\"${MOCK_VERSION#v}\"}" ]]
     # Upgrades preserve the existing service's explicit network settings.
     sed -i '/^ExecStart=/i Environment=NETWORK=local NETUID=5' /etc/systemd/system/sn46-validator.service
     cp /etc/systemd/system/sn46-validator.service "$test_dir/service"
@@ -116,5 +125,12 @@ SH
     cmp "$test_dir/config" /etc/sn46-validator/config
     grep -Fx 'restart sn46-validator.service' "$MOCK_SYSTEMCTL_LOG"
     grep -Fx 'ExecStart=' /etc/systemd/system/sn46-validator.service.d/99-sn46-validator.conf
+    # A release without a manifest (v0.1.2 and older) records sequence 0; the timer stays on.
+    rm "$MOCK_ASSETS/manifest.json"
+    : > "$MOCK_SYSTEMCTL_LOG"
+    bash "$repository_dir/install.sh" > "$test_dir/output"
+    [[ $(cat /var/lib/sn46-validator-update/release.json) == "{\"sequence\":0,\"version\":\"${MOCK_VERSION#v}\"}" ]]
+    grep -Fx 'enable --now sn46-validator-update.timer' "$MOCK_SYSTEMCTL_LOG"
+    [[ -f /etc/systemd/system/sn46-validator-update.timer ]]
     echo 'Systemd installer checks passed'
 fi

@@ -33,8 +33,8 @@ jobs:
           apt-get install -y --no-install-recommends shellcheck
       - name: Check installer
         run: |
-          bash -n install.sh tests/install.sh
-          shellcheck install.sh tests/install.sh
+          bash -n install.sh tests/install.sh scripts/sign-release.sh
+          shellcheck install.sh tests/install.sh scripts/sign-release.sh
           bash tests/install.sh
       - name: Install Rust
         run: |
@@ -118,4 +118,6 @@ jobs:
               --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" \
               dist/sn46-validator-linux-x86_64 dist/SHA256SUMS
           fi
-          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          # Stays a draft: the owner signs it offline (scripts/sign-release.sh), uploads
+          # manifest.json + manifest.sig and marks it latest. Validators auto-update only
+          # from a signed latest release.

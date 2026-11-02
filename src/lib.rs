@@ -5,3 +5,4 @@ mod commit_reveal;
 pub mod runtime;
 pub mod scoring;
 pub mod state;
+pub mod update;

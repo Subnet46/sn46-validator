@@ -77,6 +77,60 @@ UNIT
     fi
 }
 
+write_update_units() {
+    cat > "$work_dir/update.service" <<'UNIT'
+[Unit]
+Description=SN46 validator signed auto-update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/sn46-validator/config
+ExecStart=/usr/local/bin/sn46-validator update
+TimeoutStartSec=15min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/usr/local/bin
+StateDirectory=sn46-validator-update
+StateDirectoryMode=0700
+PrivateTmp=true
+UNIT
+    cat > "$work_dir/update.timer" <<'UNIT'
+[Unit]
+Description=Check for signed SN46 validator releases
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+# The release sequence the updater compares against: from this version's signed manifest when
+# it has one (its version and binary checksum must match what was installed), else 0. The
+# updater verifies the signature itself and adopts the sequence of the running version.
+write_release_state() {
+    local sequence=0
+    if [[ -s $work_dir/manifest.json ]] &&
+        grep -Fq "\"version\":\"${version#v}\"" "$work_dir/manifest.json" &&
+        grep -Fq "\"sha256\":\"$digest\"" "$work_dir/manifest.json"; then
+        sequence=$(grep -o '"sequence":[0-9]*' "$work_dir/manifest.json" | cut -d: -f2)
+        [[ $sequence =~ ^[0-9]+$ ]] || sequence=0
+    fi
+    printf '{"sequence":%s,"version":"%s"}\n' "$sequence" "${version#v}" > "$work_dir/release.json"
+    if [[ ! -d /var/lib/sn46-validator-update ]]; then
+        "${elevate[@]}" install -d -m 0700 /var/lib/sn46-validator-update
+    fi
+    "${elevate[@]}" install -m 0644 "$work_dir/release.json" /var/lib/sn46-validator-update/release.json
+}
+
 start_service() {
     if [[ -f $work_dir/service ]]; then
         "${elevate[@]}" install -d -m 0700 /etc/sn46-validator
@@ -87,12 +141,19 @@ start_service() {
     printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/sn46-validator run\n' > "$work_dir/override.conf"
     "${elevate[@]}" install -d -m 0755 "/etc/systemd/system/$service.d"
     "${elevate[@]}" install -m 0644 "$work_dir/override.conf" "/etc/systemd/system/$service.d/99-sn46-validator.conf"
+    write_update_units
+    "${elevate[@]}" install -m 0644 "$work_dir/update.service" /etc/systemd/system/sn46-validator-update.service
+    "${elevate[@]}" install -m 0644 "$work_dir/update.timer" /etc/systemd/system/sn46-validator-update.timer
+    write_release_state
     "${elevate[@]}" systemctl daemon-reload
     "${elevate[@]}" systemctl enable "$service"
     "${elevate[@]}" systemctl restart "$service"
     "${elevate[@]}" systemctl is-active --quiet "$service" || die "Service failed to start; check journalctl -u $service."
+    "${elevate[@]}" systemctl enable --now sn46-validator-update.timer
     printf '\n✅ %s started; it will restart after reboot.\n' "$service"
     printf 'Logs: sudo journalctl -u %s -f -o cat\n' "$service"
+    printf 'Signed updates install automatically (AUTO_UPDATE=0 in /etc/sn46-validator/config turns them off).\n'
+    printf 'Update log: sudo journalctl -u sn46-validator-update\n'
 }
 
 main() {
@@ -125,6 +186,10 @@ main() {
         curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15 \
             --output "$work_dir/$file" "$repository/releases/download/$version/$file"
     done
+    # The signed release manifest (for the updater's sequence); older releases have none.
+    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15 \
+        --output "$work_dir/manifest.json" "$repository/releases/download/$version/manifest.json" 2>/dev/null ||
+        rm -f -- "$work_dir/manifest.json"
     read -r digest checksum_file < "$work_dir/SHA256SUMS"
     [[ $digest =~ ^[a-f0-9]{64}$ && $checksum_file == "$asset" ]] || die 'Missing binary checksum.'
     (cd "$work_dir" && sha256sum --check --status SHA256SUMS) || die 'Checksum verification failed.'

@@ -3,11 +3,13 @@
 use std::io::Read;
 use std::time::Duration;
 
-use crate::burn::{BurnError, BurnFraction, Burner};
-use crate::chain::{Chain, ChainError, validate_chain};
+use crate::burn::{BurnError, BurnPolicy, Burner};
+use crate::chain::{Chain, ChainError, ChainSnapshot, validate_chain};
 use crate::scoring::log_score_records;
 use crate::state::{StateError, StateStore, ValidatorState};
-use sn46_shared::epoch_summary::{EpochSummaryError, MAX_EPOCH_SUMMARY_BYTES, parse_epoch_summary};
+use sn46_shared::epoch_summary::{
+    EpochSummary, EpochSummaryError, MAX_EPOCH_SUMMARY_BYTES, parse_epoch_summary,
+};
 use sn46_shared::scoring::{MinerScore, score_epoch_summary};
 
 /// Any failure `main` logs as `Validator run failed` and maps to exit code 1.
@@ -28,10 +30,25 @@ pub enum RunError {
 
 pub type Fetch<'a> = &'a dyn Fn(&str, Duration) -> Result<Vec<u8>, RunError>;
 
+/// How soon after a stale summary to look again. The platform publishes each epoch a few
+/// seconds after the chain steps; a poll that lands in that gap sees last epoch's summary.
+pub const STALE_RETRY: Duration = Duration::from_secs(30);
+
+/// The wait before the next run. A stale summary is retried after [`STALE_RETRY`]: with a
+/// poll interval that is a whole number of epochs (1320 s against the localnet's 132 s)
+/// every poll landed in the same gap and failed, so the validator never scored a summary
+/// until it was restarted. Anything else waits the configured interval.
+pub fn next_delay(outcome: &Result<(), RunError>, poll_interval: Duration) -> Duration {
+    match outcome {
+        Err(RunError::Chain(ChainError::StaleEpoch)) => STALE_RETRY.min(poll_interval),
+        _ => poll_interval,
+    }
+}
+
 pub fn fetch_epoch_summary(url: &str, timeout: Duration) -> Result<Vec<u8>, RunError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
-        .user_agent("sn46-validator/0.1")
+        .user_agent(concat!("sn46-validator/", env!("CARGO_PKG_VERSION")))
         .http_status_as_error(true)
         .build()
         .new_agent();
@@ -65,6 +82,21 @@ pub struct Run<'a> {
     pub burner: &'a dyn Burner,
     pub timeout: Duration,
     pub fetch: Fetch<'a>,
+}
+
+/// The burn the summary's signed miner target asks for. A summary without one (schema v2)
+/// sets no weights: there is no fixed fraction to fall back on.
+fn target_policy(epoch_summary: &EpochSummary) -> Result<BurnPolicy, BurnError> {
+    match (
+        epoch_summary.miner_target_usd_cents,
+        epoch_summary.tao_price_usd_cents,
+    ) {
+        (Some(target), Some(price)) => Ok(BurnPolicy::Target {
+            miner_target_usd_cents: target.get(),
+            tao_price_usd_cents: price.get(),
+        }),
+        _ => Err(BurnError("Summary carries no miner target".into())),
+    }
 }
 
 pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
@@ -125,14 +157,26 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
             .ok_or_else(|| BurnError("Validator hotkey is not registered".into()))?;
         if snapshot.last_updates[validator_uid] >= epoch_summary_end {
             tracing::info!("Weights already on chain epoch_end_block={epoch_summary_end}");
+        } else if let Some(allowed_from) = rate_limited(&snapshot, validator_uid) {
+            // The chain would reject the extrinsic and the pending record would then lock
+            // submissions for a whole mortal era, so wait quietly: the next poll retries,
+            // and a newer summary supersedes this epoch.
+            tracing::info!(
+                "Weights rate-limited last_update={} limit={} allowed_from_block={allowed_from} finalized_block={}",
+                snapshot.last_updates[validator_uid],
+                snapshot.weights_rate_limit,
+                snapshot.finalized_block
+            );
+            return Ok(records);
         } else {
+            let burn = target_policy(&epoch_summary)?;
             // Retries still need miner scores for partial or zero burn, without logging them again.
             let retry_records = already_processed.then(|| score_epoch_summary(&epoch_summary));
             let message = run.burner.submit(
                 epoch_summary.netuid.get(),
                 snapshot.finalized_block,
                 retry_records.as_deref().unwrap_or(&records),
-                BurnFraction::CURRENT,
+                burn,
             )?;
             tracing::info!(
                 "✅ Weight submission finalized epoch_end_block={epoch_summary_end} result={message}"
@@ -146,9 +190,31 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
     Ok(records)
 }
 
+/// The first block at which `WeightsSetRateLimit` lets this validator set weights again,
+/// when that is still ahead of the finalized head. A validator that never set weights is
+/// never limited.
+fn rate_limited(snapshot: &ChainSnapshot, validator_uid: usize) -> Option<u64> {
+    let last_update = snapshot.last_updates[validator_uid];
+    let allowed_from = last_update.saturating_add(snapshot.weights_rate_limit);
+    (last_update > 0 && allowed_from > snapshot.finalized_block).then_some(allowed_from)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn a_stale_summary_is_retried_soon_and_anything_else_waits_the_interval() {
+        let poll = Duration::from_secs(1320);
+        let stale = Err(RunError::Chain(ChainError::StaleEpoch));
+        assert_eq!(next_delay(&stale, poll), STALE_RETRY);
+        assert_eq!(
+            next_delay(&stale, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(next_delay(&Ok(()), poll), poll);
+        assert_eq!(next_delay(&Err(RunError::Fetch("down".into())), poll), poll);
+    }
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -156,10 +222,9 @@ pub(crate) mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::chain::ChainSnapshot;
     use crate::chain::tests::{fixture, fixture_snapshot, snapshot_of};
 
-    const RAW: &[u8] = include_str!("../tests/fixtures/epoch_summary_v2.json").as_bytes();
+    const RAW: &[u8] = include_str!("../tests/fixtures/epoch_summary_v3.json").as_bytes();
 
     fn raw() -> Vec<u8> {
         RAW.strip_suffix(b"\n").unwrap().to_vec()
@@ -182,6 +247,7 @@ pub(crate) mod tests {
         pub fail: Cell<bool>,
         pub calls: RefCell<Vec<(u64, u64)>>,
         pub scores: RefCell<Vec<Vec<MinerScore>>>,
+        pub burns: RefCell<Vec<BurnPolicy>>,
     }
 
     impl FakeBurner {
@@ -191,6 +257,7 @@ pub(crate) mod tests {
                 fail: Cell::new(fail),
                 calls: RefCell::new(vec![]),
                 scores: RefCell::new(vec![]),
+                burns: RefCell::new(vec![]),
             }
         }
     }
@@ -204,9 +271,10 @@ pub(crate) mod tests {
             netuid: u64,
             finalized_block: u64,
             miners: &[MinerScore],
-            _burn: BurnFraction,
+            burn: BurnPolicy,
         ) -> Result<String, BurnError> {
             self.calls.borrow_mut().push((netuid, finalized_block));
+            self.burns.borrow_mut().push(burn);
             self.scores.borrow_mut().push(miners.to_vec());
             if self.fail.get() {
                 return Err(BurnError("failed".into()));
@@ -298,7 +366,8 @@ pub(crate) mod tests {
         assert_eq!(*chain.netuids.borrow(), [46]);
         let uids: Vec<u64> = records.iter().map(|record| record.miner.uid).collect();
         assert_eq!(uids, [12, 37, 55]);
-        assert_eq!(weights(&records), [65_535, 30_287, 0]);
+        // uid 55 failed one proof of 80, which the scoring forgives.
+        assert_eq!(weights(&records), [65_535, 30_287, 54_409]);
         let messages = log.messages();
         assert_eq!(
             messages
@@ -311,6 +380,34 @@ pub(crate) mod tests {
             messages[messages.len() - 2],
             "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3"
         );
+    }
+
+    #[test]
+    fn a_summary_without_a_miner_target_is_scored_but_sets_no_weights() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = fixture_snapshot();
+        let burner = FakeBurner::new(&snapshot.hotkeys[12], false);
+        let chain = FixedChain {
+            snapshot,
+            netuids: RefCell::new(vec![]),
+        };
+        let store = StateStore::new(temp.path().join("state.json"));
+        let v2 = |_: &str, _: Duration| {
+            Ok(include_str!("../tests/fixtures/epoch_summary_v2.json")
+                .trim_end()
+                .as_bytes()
+                .to_vec())
+        };
+        let mut arguments = run(&chain, &store, &burner);
+        arguments.fetch = &v2;
+        assert_eq!(
+            run_once(&arguments).unwrap_err().to_string(),
+            "Summary carries no miner target"
+        );
+        assert!(burner.calls.borrow().is_empty());
+        let saved = store.load().unwrap();
+        assert_eq!(saved.summary_epoch_end_block, Some(720));
+        assert_eq!(saved.burn_epoch_end_block, None);
     }
 
     #[test]
@@ -329,6 +426,13 @@ pub(crate) mod tests {
         assert_eq!(first.len(), 3);
         assert!(second.is_empty());
         assert_eq!(*burner.calls.borrow(), [(46, 722)]);
+        assert_eq!(
+            *burner.burns.borrow(),
+            [BurnPolicy::Target {
+                miner_target_usd_cents: 10_000,
+                tao_price_usd_cents: 30_160,
+            }]
+        );
         let saved = store.load().unwrap();
         assert_eq!(saved.summary_id.as_deref(), Some("local-46-361-720"));
         assert_eq!(saved.summary_digest, Some(fixture().digest));
@@ -385,6 +489,55 @@ pub(crate) mod tests {
         );
     }
 
+    /// A weight set 40 blocks before the finalized head under a 100-block limit is skipped
+    /// without touching the burner or the state, so the next poll retries it.
+    #[test]
+    fn rate_limited_weights_wait_for_the_next_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture_snapshot();
+        snapshot.last_updates[12] = snapshot.finalized_block - 40;
+        snapshot.weights_rate_limit = 100;
+        let burner = FakeBurner::new(&snapshot.hotkeys[12], false);
+        let mut chain = FixedChain {
+            snapshot,
+            netuids: RefCell::new(vec![]),
+        };
+        let store = StateStore::new(temp.path().join("state.json"));
+        let log = Log::default();
+        let records = log
+            .capture(|| run_once(&run(&chain, &store, &burner)))
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(burner.calls.borrow().is_empty());
+        assert_eq!(store.load().unwrap().burn_epoch_end_block, None);
+        assert_eq!(
+            log.messages().last().unwrap(),
+            "Weights rate-limited last_update=682 limit=100 allowed_from_block=782 finalized_block=722"
+        );
+
+        // Once the head passes the allowed block, the same summary is submitted.
+        chain.snapshot.finalized_block = 782;
+        let records = run_once(&run(&chain, &store, &burner)).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(*burner.calls.borrow(), [(46, 782)]);
+        assert_eq!(store.load().unwrap().burn_epoch_end_block, Some(720));
+    }
+
+    #[test]
+    fn rate_limit_is_inert_at_zero_and_for_a_validator_that_never_set_weights() {
+        let mut snapshot = fixture_snapshot();
+        assert_eq!(rate_limited(&snapshot, 12), None);
+        snapshot.weights_rate_limit = 100;
+        assert_eq!(rate_limited(&snapshot, 12), None, "never set weights");
+        snapshot.last_updates[12] = snapshot.finalized_block;
+        assert_eq!(
+            rate_limited(&snapshot, 12),
+            Some(snapshot.finalized_block + 100)
+        );
+        snapshot.weights_rate_limit = 0;
+        assert_eq!(rate_limited(&snapshot, 12), None, "limit 0");
+    }
+
     #[test]
     fn failed_burn_is_retried_without_reprocessing_epoch_summary() {
         let temp = tempfile::tempdir().unwrap();
@@ -427,7 +580,7 @@ pub(crate) mod tests {
 
         let signer = Keypair::from_uri(&"//Dave".parse::<SecretUri>().unwrap()).unwrap();
         let sign = |summary: &mut EpochSummary| {
-            let payload = summary.signing_payload();
+            let payload = summary.signing_payload().unwrap();
             summary.digest = format!("sha256:{}", hex::encode(Sha256::digest(&payload)));
             summary.signature = hex::encode(signer.sign(payload.as_bytes()).0);
         };
@@ -449,7 +602,7 @@ pub(crate) mod tests {
         let mut summary = original;
         summary.created_at_ms = std::num::NonZeroU64::new(summary.created_at_ms.get() + 1).unwrap();
         sign(&mut summary);
-        let changed = |_: &str, _: Duration| Ok(summary.canonical_json().into_bytes());
+        let changed = |_: &str, _: Duration| Ok(summary.canonical_json().unwrap().into_bytes());
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &changed;
         assert!(matches!(
@@ -466,7 +619,7 @@ pub(crate) mod tests {
         sign(&mut summary);
         chain.snapshot.last_step = 1080;
         chain.snapshot.finalized_block = 1082;
-        let fetch = |_: &str, _: Duration| Ok(summary.canonical_json().into_bytes());
+        let fetch = |_: &str, _: Duration| Ok(summary.canonical_json().unwrap().into_bytes());
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &fetch;
         assert_eq!(run_once(&arguments).unwrap().len(), 3);
@@ -496,9 +649,9 @@ pub(crate) mod tests {
         let restarted = run_once(&run(&chain, &second_store, &burner)).unwrap();
         assert_eq!(first, late);
         assert!(restarted.is_empty());
-        assert_eq!(weights(&first), [65_535, 30_287, 0]);
-        assert_eq!(first[2].score_bps, 0);
-        assert!(first[2].disqualified);
+        assert_eq!(weights(&first), [65_535, 30_287, 54_409]);
+        assert_eq!(first[2].score_bps, 8_294);
+        assert!(!first[2].disqualified);
     }
 
     #[test]
@@ -561,5 +714,48 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// Rewrite the log lines of `tests/golden/runtime_cases.json` from the current code,
+    /// keeping every other field. Run after a scoring change with
+    /// `cargo test regenerate_runtime_cases -- --ignored`, then review the diff.
+    #[test]
+    #[ignore = "rewrites the golden file"]
+    fn regenerate_runtime_cases() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/runtime_cases.json"
+        );
+        let mut cases: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for case in cases.as_array_mut().unwrap() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = StateStore::new(temp.path().join("state.json"));
+            for run_case in case["runs"].as_array_mut().unwrap() {
+                if let Some(before) = run_case["state_before"].as_object() {
+                    store
+                        .save(&ValidatorState {
+                            summary_id: before["summary_id"].as_str().map(str::to_owned),
+                            summary_digest: before["summary_digest"].as_str().map(str::to_owned),
+                            summary_epoch_end_block: before["summary_epoch_end_block"].as_u64(),
+                            burn_epoch_end_block: before["burn_epoch_end_block"].as_u64(),
+                        })
+                        .unwrap();
+                }
+                let spec = &run_case["burner"];
+                let burner = FakeBurner::new(
+                    spec["hotkey"].as_str().unwrap(),
+                    spec["fail"].as_bool().unwrap(),
+                );
+                let chain = FixedChain {
+                    snapshot: snapshot_of(&run_case["snapshot"]),
+                    netuids: RefCell::new(vec![]),
+                };
+                let log = Log::default();
+                let _ = log.capture(|| run_once(&run(&chain, &store, &burner)));
+                run_case["messages"] = json!(log.messages());
+            }
+        }
+        std::fs::write(path, serde_json::to_string(&cases).unwrap() + "\n").unwrap();
     }
 }

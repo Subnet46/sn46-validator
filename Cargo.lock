@@ -127,6 +127,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "ark-bls12-377"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,6 +1306,20 @@ checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8",
  "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "serde",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2894,9 +2914,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -3366,6 +3386,9 @@ name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core 0.6.4",
+]
 
 [[package]]
 name = "simd-adler32"
@@ -3517,11 +3540,14 @@ dependencies = [
 [[package]]
 name = "sn46-shared"
 version = "0.1.0"
-source = "git+https://github.com/Subnet46/sn46-shared?rev=2587d615219cfa825cfc7c7fa9b585c7056864ba#2587d615219cfa825cfc7c7fa9b585c7056864ba"
+source = "git+https://github.com/Subnet46/sn46-shared?rev=e7147c8ac545151a88e61448af83a6a8be89176b#e7147c8ac545151a88e61448af83a6a8be89176b"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
  "blake2 0.11.0",
  "bs58",
  "hex",
+ "ryu",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3532,13 +3558,16 @@ dependencies = [
 
 [[package]]
 name = "sn46-validator"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "ark-serialize 0.4.2",
  "clap",
+ "ed25519-dalek",
  "futures-util",
  "hex",
+ "libc",
  "rand_core 0.6.4",
+ "schnorrkel",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4531,9 +4560,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
