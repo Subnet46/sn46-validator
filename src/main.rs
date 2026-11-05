@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, CommandFactory, Parser, ValueEnum};
+use sn46_shared::identity::decode_registered_ss58;
 use sn46_validator::burn::BittensorBurnWriter;
 use sn46_validator::chain::BittensorChain;
 use sn46_validator::runtime::{Run, RunError, fetch_epoch_summary, next_delay, run_once};
@@ -17,6 +18,7 @@ use tracing_subscriber::fmt::format::Writer;
 
 /// The platform host by its sslip.io name, hardcoded until the instantnetwork.ai zone moves.
 const PLATFORM_URL: &str = "https://167-172-24-161.sslip.io/validator/v1/epoch-summaries/latest";
+/// The platform keys a summary may be signed by, comma-separated (two while a key rotates).
 const PLATFORM_SIGNER: &str = "5FutpWD5tJHoqaX3DaDwiqn2isxmZ19VeRECRd6vgSif4moZ";
 
 #[derive(Parser)]
@@ -45,7 +47,7 @@ enum Command {
 
 #[derive(Args)]
 struct Options {
-    /// Trusted platform SS58 address.
+    /// Trusted platform SS58 addresses, comma-separated; a summary signed by any of them is accepted.
     #[arg(long, env = "PLATFORM_SIGNER", default_value = PLATFORM_SIGNER)]
     platform_signer: Option<String>,
     /// Chain network: finney, test, or local.
@@ -102,12 +104,34 @@ fn configuration_error(message: &str) -> clap::Error {
     Cli::command().error(clap::error::ErrorKind::ValueValidation, message)
 }
 
+/// The trusted signers of a comma-separated list: each an SS58 address, blanks ignored, at
+/// least one.
+fn parse_signers(list: &str) -> Result<Vec<String>, clap::Error> {
+    let mut signers: Vec<String> = Vec::new();
+    for signer in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if decode_registered_ss58(signer).is_none() {
+            return Err(configuration_error(&format!(
+                "PLATFORM_SIGNER: {signer} is not an SS58 address"
+            )));
+        }
+        if !signers.iter().any(|known| known == signer) {
+            signers.push(signer.to_owned());
+        }
+    }
+    if signers.is_empty() {
+        return Err(configuration_error(
+            "PLATFORM_SIGNER is required (or pass --platform-signer)",
+        ));
+    }
+    Ok(signers)
+}
+
 struct Config {
     network: String,
     netuid: NonZeroU16,
     endpoint: String,
     epoch_summary_url: String,
-    platform_signer: String,
+    platform_signers: Vec<String>,
     state: StateStore,
     poll_interval: Duration,
     transaction_timeout: Duration,
@@ -118,12 +142,7 @@ struct Config {
 
 impl Config {
     fn from_options(options: Options) -> Result<Self, clap::Error> {
-        let platform_signer = options
-            .platform_signer
-            .filter(|signer| !signer.is_empty())
-            .ok_or_else(|| {
-                configuration_error("PLATFORM_SIGNER is required (or pass --platform-signer)")
-            })?;
+        let platform_signers = parse_signers(options.platform_signer.as_deref().unwrap_or(""))?;
         let epoch_summary_url = options
             .platform_epoch_summary_url
             .map(|url| url.trim().to_owned())
@@ -138,7 +157,7 @@ impl Config {
             netuid: options.netuid,
             endpoint: options.chain_endpoint,
             epoch_summary_url,
-            platform_signer,
+            platform_signers,
             state: StateStore::new(options.state_path),
             poll_interval: Duration::from_secs(options.poll_interval_secs),
             transaction_timeout: Duration::from_secs(options.transaction_timeout_secs),
@@ -163,7 +182,7 @@ impl Config {
             network: &self.network,
             netuid: u64::from(self.netuid.get()),
             epoch_summary_url: &self.epoch_summary_url,
-            platform_signer: &self.platform_signer,
+            platform_signers: &self.platform_signers,
             chain: &chain,
             state: &self.state,
             burner: &burner,
@@ -314,7 +333,26 @@ mod tests {
         assert_eq!(config.netuid.get(), 46);
         assert!(config.endpoint.is_empty());
         assert_eq!(config.epoch_summary_url, PLATFORM_URL);
-        assert_eq!(config.platform_signer, PLATFORM_SIGNER);
+        assert_eq!(config.platform_signers, [PLATFORM_SIGNER]);
+    }
+
+    #[test]
+    fn platform_signer_takes_a_comma_separated_list() {
+        const OLD: &str = "5FutpWD5tJHoqaX3DaDwiqn2isxmZ19VeRECRd6vgSif4moZ";
+        const NEW: &str = "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy";
+        let signers = |arg: &str| {
+            let cli = Cli::try_parse_from(["sn46-validator", "--platform-signer", arg]).unwrap();
+            Config::from_options(cli.options).map(|config| config.platform_signers)
+        };
+        assert_eq!(signers(NEW).unwrap(), [NEW]);
+        assert_eq!(signers(&format!("{OLD},{NEW}")).unwrap(), [OLD, NEW]);
+        assert_eq!(
+            signers(&format!(" {NEW} , ,{OLD},{NEW},")).unwrap(),
+            [NEW, OLD]
+        );
+        for bad in ["", " , ", &format!("{OLD},nope")] {
+            assert!(signers(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
