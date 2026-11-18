@@ -8,7 +8,7 @@ use subxt::rpcs::client::jsonrpsee_client;
 use subxt::utils::AccountId32;
 use subxt::{OnlineClient, SubstrateConfig};
 
-use sn46_shared::epoch_summary::EpochSummary;
+use sn46_shared::epoch_summary::{EpochSummary, Verifier};
 use sn46_shared::identity::{SS58_FORMAT, encode_ss58};
 
 /// The SDK's network table (`bittensor.core.settings.NETWORK_MAP`) with the genesis hash
@@ -103,6 +103,35 @@ pub fn validate_chain(
         }
     }
     Ok(())
+}
+
+/// A summary's verifier row and whether the finalized chain still gives its UID its hotkey.
+/// Every row's share is computed; only a row that holds is paid, and a stale one's share
+/// stays in the burn. A verifier UID pruned, re-registered or swapped since the platform
+/// signed the summary never pays the new occupant and never refuses the miners' weights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedVerifier {
+    pub verifier: Verifier,
+    pub on_chain: bool,
+}
+
+/// The summary's verifier rows checked against the finalized roster; empty before v4.
+pub fn check_verifiers(
+    epoch_summary: &EpochSummary,
+    snapshot: &ChainSnapshot,
+) -> Vec<CheckedVerifier> {
+    epoch_summary
+        .verifiers
+        .iter()
+        .flatten()
+        .map(|verifier| CheckedVerifier {
+            on_chain: usize::try_from(verifier.uid)
+                .ok()
+                .and_then(|index| snapshot.hotkeys.get(index))
+                .is_some_and(|expected| *expected == verifier.hotkey),
+            verifier: verifier.clone(),
+        })
+        .collect()
 }
 
 fn lookup(error: impl std::fmt::Display) -> ChainError {
@@ -366,6 +395,42 @@ pub(crate) mod tests {
             validate_chain(&epoch_summary, &next),
             Err(ChainError::StaleEpoch)
         );
+    }
+
+    /// A v4 summary's verifier rows are checked like miner rows, but one the chain no
+    /// longer holds is only marked unpaid: the summary stays valid for the miners.
+    #[test]
+    fn verifier_rows_are_checked_against_the_roster_without_refusing_the_summary() {
+        let mut epoch_summary: EpochSummary =
+            serde_json::from_str(include_str!("../tests/fixtures/epoch_summary_v4.json")).unwrap();
+        let ferdie = epoch_summary.verifiers.as_ref().unwrap()[0].clone();
+        let other = Verifier {
+            uid: 200,
+            ..ferdie.clone()
+        };
+        epoch_summary.verifiers.as_mut().unwrap().push(Verifier {
+            hotkey: "5HGjWAeFDfFCWPsjFQdVV2Msvz2XtMktvgocEZcCj68kUMaw".into(),
+            ..other
+        });
+        let mut snapshot = fixture_snapshot();
+        assert!(validate_chain(&epoch_summary, &snapshot).is_ok());
+        let paid = |snapshot: &ChainSnapshot| -> Vec<bool> {
+            check_verifiers(&epoch_summary, snapshot)
+                .iter()
+                .map(|row| row.on_chain)
+                .collect()
+        };
+        // UID 90 is beyond this roster and UID 200 too: neither is paid.
+        assert_eq!(paid(&snapshot), [false, false]);
+        snapshot.hotkeys.resize(91, "unused".into());
+        snapshot.last_updates.resize(91, 0);
+        snapshot.hotkeys[90] = ferdie.hotkey.clone();
+        assert_eq!(paid(&snapshot), [true, false]);
+        // Swapped or re-registered: another hotkey on the UID is not paid.
+        snapshot.hotkeys[90] = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into();
+        assert_eq!(paid(&snapshot), [false, false]);
+        assert!(validate_chain(&epoch_summary, &snapshot).is_ok());
+        assert!(check_verifiers(&fixture(), &snapshot).is_empty());
     }
 
     #[test]

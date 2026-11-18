@@ -45,7 +45,7 @@ fn runtime_393_reads_roster_and_finalizes_owner_burn() {
         BittensorBurnWriter::new(&chain, "validator", "default", wallet.path(), &state).unwrap();
     assert_eq!(
         writer
-            .submit(5, block, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(5, block, &[], &[], BurnPolicy::Fixed(BurnFraction::FULL))
             .unwrap(),
         "finalized"
     );

@@ -5,6 +5,8 @@ SN46 validator for Linux x86_64 (Ubuntu 22.04+). Defaults to **Finney mainnet, s
 
 The validator accepts a summary signed by any key in `PLATFORM_SIGNER` (`--platform-signer`), a comma-separated list of SS58 addresses; the log line `Summary verified ... signer=<SS58>` names the key that signed it. To rotate the platform key, a release lists both the old and the new key until the platform has switched; a summary signed by any other key is refused.
 
+Weights follow the summary: miners by their scores, scaled so they together earn the summary's signed USD target, and the rest burned on the subnet owner UID. A schema-v4 summary also lists the verifiers that checked the epoch's proofs, each on its own registered UID: together they are paid one paid miner's mean share out of the burn, never more than the burn holds, so the miners' part is the same as without them. A verifier whose UID no longer holds the listed hotkey on the finalized chain is not paid and its share stays burned; the miners are weighted either way. The log shows each `Verifier share ...` line next to `Weights prepared ...`. Releases before this one refuse v4 summaries and set no weights while the platform publishes them.
+
 
 Follow Instant on X: [@thinkinstant](https://x.com/thinkinstant).
 

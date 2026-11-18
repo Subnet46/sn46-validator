@@ -103,7 +103,13 @@ fn writer_submits_the_full_owner_burn_vector() {
     assert_eq!(writer.hotkey(), DEVELOPMENT_HOTKEY);
 
     let result = writer
-        .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+        .submit(
+            NETUID,
+            BLOCK,
+            &[],
+            &[],
+            BurnPolicy::Fixed(BurnFraction::FULL),
+        )
         .unwrap();
 
     assert_eq!(result, "finalized");
@@ -168,11 +174,11 @@ fn writer_submits_the_scored_vector_with_the_burn_share() {
         let burn = BurnFraction::from_bps(bps).unwrap();
 
         let result = writer
-            .submit(NETUID, BLOCK, &records, BurnPolicy::Fixed(burn))
+            .submit(NETUID, BLOCK, &records, &[], BurnPolicy::Fixed(burn))
             .unwrap();
 
         assert_eq!(result, "finalized");
-        let expected = weights(&records, OWNER_UID, burn).unwrap();
+        let expected = weights(&records, &[], OWNER_UID, burn).unwrap();
         assert_eq!(expected.0.contains(&OWNER_UID), bps > 0);
         assert_eq!(
             expected.0.len(),
@@ -203,7 +209,13 @@ fn writer_refuses_non_burn_subnets() {
     node.set_subtensor("RecycleOrBurn", vec![], 1u8);
     assert_eq!(
         writer
-            .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(
+                NETUID,
+                BLOCK,
+                &[],
+                &[],
+                BurnPolicy::Fixed(BurnFraction::FULL)
+            )
             .unwrap_err()
             .0,
         "Subnet is not in Burn mode"
@@ -248,6 +260,7 @@ fn writer_submits_timelocked_weights_when_commit_reveal_is_enabled() {
                 NETUID,
                 BLOCK,
                 &scored(),
+                &[],
                 BurnPolicy::Fixed(BurnFraction::FULL)
             )
             .unwrap(),
@@ -299,7 +312,13 @@ fn unknown_commit_reveal_protocol_is_refused_before_submission() {
     .unwrap();
     assert!(
         writer
-            .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(
+                NETUID,
+                BLOCK,
+                &[],
+                &[],
+                BurnPolicy::Fixed(BurnFraction::FULL)
+            )
             .unwrap_err()
             .0
             .contains("unsupported commit/reveal version 5")
@@ -321,7 +340,13 @@ fn stalled_submission_times_out_and_a_restart_cannot_submit_a_duplicate() {
                 .with_timeout(Duration::from_secs(1));
         assert!(
             writer
-                .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+                .submit(
+                    NETUID,
+                    BLOCK,
+                    &[],
+                    &[],
+                    BurnPolicy::Fixed(BurnFraction::FULL)
+                )
                 .unwrap_err()
                 .0
                 .contains("timed out")
@@ -334,7 +359,13 @@ fn stalled_submission_times_out_and_a_restart_cannot_submit_a_duplicate() {
             .unwrap();
     assert!(
         writer
-            .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(
+                NETUID,
+                BLOCK,
+                &[],
+                &[],
+                BurnPolicy::Fixed(BurnFraction::FULL)
+            )
             .unwrap_err()
             .0
             .contains("Previous submission is uncertain")
@@ -364,7 +395,13 @@ fn stalled_submission_times_out_and_a_restart_cannot_submit_a_duplicate() {
     node.set_events(true);
     assert_eq!(
         writer
-            .submit(NETUID, expired, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(
+                NETUID,
+                expired,
+                &[],
+                &[],
+                BurnPolicy::Fixed(BurnFraction::FULL)
+            )
             .unwrap(),
         "finalized"
     );
@@ -397,7 +434,13 @@ fn missing_owner_or_uid_is_refused_before_signing() {
     node.cassette.set_storage(&owner_key, json!(null));
     assert_eq!(
         writer
-            .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(
+                NETUID,
+                BLOCK,
+                &[],
+                &[],
+                BurnPolicy::Fixed(BurnFraction::FULL)
+            )
             .unwrap_err()
             .0,
         "Subnet owner hotkey is invalid"
@@ -416,7 +459,13 @@ fn missing_owner_or_uid_is_refused_before_signing() {
     node.cassette.set_storage(&uid_key, json!(null));
     assert_eq!(
         writer
-            .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(
+                NETUID,
+                BLOCK,
+                &[],
+                &[],
+                BurnPolicy::Fixed(BurnFraction::FULL)
+            )
             .unwrap_err()
             .0,
         "Subnet owner UID or weights version is invalid"
@@ -448,7 +497,13 @@ fn extrinsic_failed_is_a_burn_error_and_finalization_alone_is_not_success() {
             _ => node.set_events(false),
         }
         let error = writer
-            .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+            .submit(
+                NETUID,
+                BLOCK,
+                &[],
+                &[],
+                BurnPolicy::Fixed(BurnFraction::FULL),
+            )
             .unwrap_err()
             .0;
         assert!(error.starts_with("Burn write failed: "), "{error}");
@@ -463,7 +518,13 @@ fn extrinsic_failed_is_a_burn_error_and_finalization_alone_is_not_success() {
         }
         assert!(
             writer
-                .submit(NETUID, BLOCK, &[], BurnPolicy::Fixed(BurnFraction::FULL))
+                .submit(
+                    NETUID,
+                    BLOCK,
+                    &[],
+                    &[],
+                    BurnPolicy::Fixed(BurnFraction::FULL)
+                )
                 .unwrap_err()
                 .0
                 .contains("Previous submission is uncertain")

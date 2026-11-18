@@ -231,6 +231,7 @@ async fn localnet_timelocked_burn_writer_finalizes() {
                     netuid as u64,
                     block,
                     &[],
+                    &[],
                     BurnPolicy::Fixed(BurnFraction::FULL),
                 )
                 .unwrap();

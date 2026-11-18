@@ -4,7 +4,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use crate::burn::{BurnError, BurnPolicy, Burner};
-use crate::chain::{Chain, ChainError, ChainSnapshot, validate_chain};
+use crate::chain::{Chain, ChainError, ChainSnapshot, check_verifiers, validate_chain};
 use crate::scoring::log_score_records;
 use crate::state::{StateError, StateStore, ValidatorState};
 use sn46_shared::epoch_summary::{
@@ -127,6 +127,14 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         run.platform_signers,
     )?;
     validate_chain(&epoch_summary, &snapshot)?;
+    let verifiers = check_verifiers(&epoch_summary, &snapshot);
+    for stale in verifiers.iter().filter(|checked| !checked.on_chain) {
+        tracing::warn!(
+            "Verifier not paid: UID {} does not hold hotkey {} on the finalized chain",
+            stale.verifier.uid,
+            stale.verifier.hotkey
+        );
+    }
     let mut saved = run.state.load()?;
     let summary_id = epoch_summary.summary_id.as_str();
     let digest = epoch_summary.digest.as_str();
@@ -195,6 +203,7 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
                 epoch_summary.netuid.get(),
                 snapshot.finalized_block,
                 retry_records.as_deref().unwrap_or(&records),
+                &verifiers,
                 burn,
             )?;
             tracing::info!(
@@ -241,6 +250,7 @@ pub(crate) mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::chain::CheckedVerifier;
     use crate::chain::tests::{fixture, fixture_snapshot, snapshot_of};
 
     const RAW: &[u8] = include_str!("../tests/fixtures/epoch_summary_v3.json").as_bytes();
@@ -267,6 +277,7 @@ pub(crate) mod tests {
         pub calls: RefCell<Vec<(u64, u64)>>,
         pub scores: RefCell<Vec<Vec<MinerScore>>>,
         pub burns: RefCell<Vec<BurnPolicy>>,
+        pub verifiers: RefCell<Vec<Vec<CheckedVerifier>>>,
     }
 
     impl FakeBurner {
@@ -277,6 +288,7 @@ pub(crate) mod tests {
                 calls: RefCell::new(vec![]),
                 scores: RefCell::new(vec![]),
                 burns: RefCell::new(vec![]),
+                verifiers: RefCell::new(vec![]),
             }
         }
     }
@@ -290,9 +302,11 @@ pub(crate) mod tests {
             netuid: u64,
             finalized_block: u64,
             miners: &[MinerScore],
+            verifiers: &[CheckedVerifier],
             burn: BurnPolicy,
         ) -> Result<String, BurnError> {
             self.calls.borrow_mut().push((netuid, finalized_block));
+            self.verifiers.borrow_mut().push(verifiers.to_vec());
             self.burns.borrow_mut().push(burn);
             self.scores.borrow_mut().push(miners.to_vec());
             if self.fail.get() {
@@ -490,6 +504,57 @@ pub(crate) mod tests {
         let saved = store.load().unwrap();
         assert_eq!(saved.summary_epoch_end_block, Some(720));
         assert_eq!(saved.burn_epoch_end_block, None);
+    }
+
+    /// A v4 summary's verifier rows reach the burn writer with whether the chain still names
+    /// them, on the first submission and on a retry; a stale one is logged and still lets
+    /// the miners be weighted.
+    #[test]
+    fn v4_verifier_rows_reach_the_burner_checked_against_the_chain() {
+        let v4 = |_: &str, _: Duration| {
+            Ok(include_str!("../tests/fixtures/epoch_summary_v4.json")
+                .trim_end()
+                .as_bytes()
+                .to_vec())
+        };
+        for holds in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut snapshot = fixture_snapshot();
+            snapshot.hotkeys.resize(91, "unused".into());
+            snapshot.last_updates.resize(91, 0);
+            if holds {
+                snapshot.hotkeys[90] = "5CiPPseXPECbkjWCa6MnjNokrgYjMqmKndv2rSnekmSK2DjL".into();
+            }
+            let burner = FakeBurner::new(&snapshot.hotkeys[12], true);
+            let chain = FixedChain {
+                snapshot,
+                netuids: RefCell::new(vec![]),
+            };
+            let store = StateStore::new(temp.path().join("state.json"));
+            let mut arguments = run(&chain, &store, &burner);
+            arguments.fetch = &v4;
+            let log = Log::default();
+            assert!(log.capture(|| run_once(&arguments)).is_err());
+            burner.fail.set(false);
+            run_once(&arguments).unwrap();
+            let calls = burner.verifiers.borrow();
+            assert_eq!(calls.len(), 2);
+            for call in calls.iter() {
+                assert_eq!(call.len(), 1);
+                assert_eq!(
+                    (call[0].verifier.uid, call[0].verifier.verdicts.get()),
+                    (90, 1_020)
+                );
+                assert_eq!(call[0].on_chain, holds);
+            }
+            assert_eq!(burner.scores.borrow()[1].len(), 3);
+            assert_eq!(
+                log.messages()
+                    .iter()
+                    .any(|line| line.starts_with("Verifier not paid: UID 90")),
+                !holds
+            );
+        }
     }
 
     #[test]

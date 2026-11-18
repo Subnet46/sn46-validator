@@ -1,4 +1,5 @@
-//! The only chain write: this epoch's weights, with the burn share on the subnet owner UID.
+//! The only chain write: this epoch's weights, with the burn share on the subnet owner UID
+//! less what the epoch's verifiers are paid out of it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,9 +23,9 @@ use subxt::rpcs::methods::legacy::LegacyRpcMethods;
 use subxt::transactions::Signer;
 use subxt::utils::{AccountId32, MultiSignature};
 
-use crate::chain::{At, BittensorChain};
+use crate::chain::{At, BittensorChain, CheckedVerifier};
 use sn46_shared::identity::{SS58_FORMAT, encode_ss58};
-use sn46_shared::scoring::{BPS, MAX_WEIGHT, MinerScore};
+use sn46_shared::scoring::{BPS, MAX_WEIGHT, MinerScore, score_verifiers};
 
 /// The authorized burn vector could not be submitted safely.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -37,12 +38,14 @@ pub trait Burner {
     /// The validator hotkey's SS58 address (`wallet.hotkey.ss58_address`).
     fn hotkey(&self) -> &str;
     /// Submit this epoch's weights pinned to `finalized_block`; the returned message is
-    /// logged.
+    /// logged. `verifiers` are the summary's verifier rows (none before schema v4), paid
+    /// out of the burn once it is priced.
     fn submit(
         &self,
         netuid: u64,
         finalized_block: u64,
         miners: &[MinerScore],
+        verifiers: &[CheckedVerifier],
         burn: BurnPolicy,
     ) -> Result<String, BurnError>;
 }
@@ -176,11 +179,51 @@ fn overflow() -> BurnError {
     BurnError("Miner emission value overflows".into())
 }
 
-/// This epoch's weight vector: every scored miner scaled by `1 - burn`, the freed share on
-/// the owner UID, max-upscaled to `MAX_WEIGHT`. `(dests, weights)` in UID order, zeros
-/// dropped; a full burn, or nothing scored, is the owner alone.
+/// What each verifier the chain still names is paid this epoch, as `(uid, share)` in the
+/// units of [`weights`]: together one paid miner's mean share out of the burn
+/// ([`score_verifiers`]), split by verdicts over every row, so a stale row's part stays in
+/// the burn. Each row is logged, paid or not.
+pub fn verifier_shares(
+    verifiers: &[CheckedVerifier],
+    miners: &[MinerScore],
+    burn: BurnFraction,
+) -> Result<Vec<(u16, u128)>, BurnError> {
+    let rows: Vec<_> = verifiers
+        .iter()
+        .map(|checked| checked.verifier.clone())
+        .collect();
+    let mut paid = Vec::new();
+    for (checked, score) in verifiers.iter().zip(score_verifiers(&rows, miners, burn.0)) {
+        tracing::info!(
+            "Verifier share uid={} hotkey={} verdicts={} paid_miners={} burn_bps={} share={} on_chain={}",
+            score.verifier.uid,
+            score.verifier.hotkey,
+            score.verifier.verdicts,
+            score.paid_miners,
+            score.burn_bps,
+            score.share,
+            checked.on_chain
+        );
+        if checked.on_chain {
+            let uid = u16::try_from(score.verifier.uid).map_err(|_| {
+                BurnError(format!(
+                    "Verifier UID {} is not a chain UID",
+                    score.verifier.uid
+                ))
+            })?;
+            paid.push((uid, score.share));
+        }
+    }
+    Ok(paid)
+}
+
+/// This epoch's weight vector: every scored miner scaled by `1 - burn`, each paid verifier
+/// its share (see [`verifier_shares`]), what is left of the burn on the owner UID, all
+/// max-upscaled together to `MAX_WEIGHT`. `(dests, weights)` in UID order, zeros dropped;
+/// a full burn, or nothing scored, is the owner alone (verifiers are then paid nothing).
 pub fn weights(
     miners: &[MinerScore],
+    verifiers: &[(u16, u128)],
     owner_uid: u16,
     burn: BurnFraction,
 ) -> Result<(Vec<u16>, Vec<u16>), BurnError> {
@@ -194,7 +237,14 @@ pub fn weights(
             .map_err(|_| BurnError(format!("Miner UID {} is not a chain UID", record.miner.uid)))?;
         *shares.entry(uid).or_insert(0) += record.normalized_weight * (BPS - burn.0);
     }
-    *shares.entry(owner_uid).or_insert(0) += total * burn.0;
+    let mut burned = total * burn.0;
+    for (uid, share) in verifiers {
+        burned = burned
+            .checked_sub(*share)
+            .ok_or_else(|| BurnError("Verifier shares exceed the burn".into()))?;
+        *shares.entry(*uid).or_insert(0) += share;
+    }
+    *shares.entry(owner_uid).or_insert(0) += burned;
     let highest = shares.values().copied().max().unwrap_or(0);
     Ok(shares
         .into_iter()
@@ -493,6 +543,7 @@ impl<'a> BittensorBurnWriter<'a> {
         netuid: u64,
         finalized_block: u64,
         miners: &[MinerScore],
+        verifiers: &[CheckedVerifier],
         burn: BurnPolicy,
     ) -> Result<String, BurnError> {
         let at = self
@@ -527,7 +578,8 @@ impl<'a> BittensorBurnWriter<'a> {
                 burn
             }
         };
-        let (dests, weights) = weights(miners, uid, burn)?;
+        let paid = verifier_shares(verifiers, miners, burn)?;
+        let (dests, weights) = weights(miners, &paid, uid, burn)?;
         tracing::info!("{}", weights_line(uid, burn, &dests, &weights));
 
         // Use a pool-aware nonce, but a mortal era so an uncertain transaction cannot
@@ -656,10 +708,11 @@ impl Burner for BittensorBurnWriter<'_> {
         netuid: u64,
         finalized_block: u64,
         miners: &[MinerScore],
+        verifiers: &[CheckedVerifier],
         burn: BurnPolicy,
     ) -> Result<String, BurnError> {
         self.chain.block_on(async {
-            tokio::time::timeout(self.timeout, self.submit_at(netuid, finalized_block, miners, burn))
+            tokio::time::timeout(self.timeout, self.submit_at(netuid, finalized_block, miners, verifiers, burn))
                 .await.map_err(|_| BurnError("Burn submission timed out; outcome may be uncertain, reconcile before retrying".into()))?
         })
     }
@@ -772,18 +825,18 @@ mod tests {
     fn full_burn_or_nothing_scored_is_the_owner_alone() {
         let owner_alone = (vec![OWNER], vec![65_535]);
         assert_eq!(
-            weights(&scored(), OWNER, BurnFraction::FULL).unwrap(),
+            weights(&scored(), &[], OWNER, BurnFraction::FULL).unwrap(),
             owner_alone
         );
         assert_eq!(
-            weights(&[], OWNER, BurnFraction::NONE).unwrap(),
+            weights(&[], &[], OWNER, BurnFraction::NONE).unwrap(),
             owner_alone
         );
     }
 
     #[test]
     fn the_weights_line_shows_the_vector_as_submitted() {
-        let (dests, weights) = weights(&scored(), OWNER, BurnFraction(5_000)).unwrap();
+        let (dests, weights) = weights(&scored(), &[], OWNER, BurnFraction(5_000)).unwrap();
         assert_eq!(
             weights_line(OWNER, BurnFraction(5_000), &dests, &weights),
             format!(
@@ -806,7 +859,7 @@ mod tests {
         let uid = records[0].miner.uid as u16;
         assert_ne!(uid, OWNER);
         assert_eq!(
-            weights(&records, OWNER, BurnFraction::NONE).unwrap(),
+            weights(&records, &[], OWNER, BurnFraction::NONE).unwrap(),
             (vec![uid], vec![65_535])
         );
     }
@@ -814,7 +867,7 @@ mod tests {
     #[test]
     fn zero_burn_is_the_scored_vector() {
         let records = scored();
-        let (dests, values) = weights(&records, OWNER, BurnFraction::NONE).unwrap();
+        let (dests, values) = weights(&records, &[], OWNER, BurnFraction::NONE).unwrap();
         let expected: Vec<(u16, u16)> = records
             .iter()
             .filter(|record| record.normalized_weight > 0)
@@ -828,7 +881,7 @@ mod tests {
     fn half_burn_gives_the_owner_the_miners_total() {
         let records = scored();
         let total: u128 = records.iter().map(|record| record.normalized_weight).sum();
-        let (dests, values) = weights(&records, OWNER, BurnFraction(5_000)).unwrap();
+        let (dests, values) = weights(&records, &[], OWNER, BurnFraction(5_000)).unwrap();
         assert_eq!(weight_of(&dests, &values, OWNER), 65_535);
         for record in records.iter().filter(|record| record.normalized_weight > 0) {
             assert_eq!(
@@ -848,10 +901,130 @@ mod tests {
             .max_by_key(|record| record.normalized_weight)
             .unwrap();
         let owner = top.miner.uid as u16;
-        let (dests, values) = weights(&records, owner, BurnFraction(5_000)).unwrap();
+        let (dests, values) = weights(&records, &[], owner, BurnFraction(5_000)).unwrap();
         assert_eq!(dests.iter().filter(|dest| **dest == owner).count(), 1);
         assert!(dests.is_sorted_by(|left, right| left < right));
         assert_eq!(weight_of(&dests, &values, owner), 65_535);
+    }
+
+    const FERDIE: &str = "5CiPPseXPECbkjWCa6MnjNokrgYjMqmKndv2rSnekmSK2DjL";
+
+    fn verifier(uid: u64, verdicts: u64, on_chain: bool) -> CheckedVerifier {
+        CheckedVerifier {
+            verifier: sn46_shared::epoch_summary::Verifier {
+                hotkey: format!("{FERDIE}{uid}"),
+                uid,
+                verdicts: std::num::NonZeroU64::new(verdicts).unwrap(),
+            },
+            on_chain,
+        }
+    }
+
+    /// Each UID's part of the submitted vector, as a fraction of the whole.
+    fn fractions(
+        miners: &[MinerScore],
+        verifiers: &[CheckedVerifier],
+        burn: BurnFraction,
+    ) -> BTreeMap<u16, f64> {
+        let paid = verifier_shares(verifiers, miners, burn).unwrap();
+        let (dests, values) = weights(miners, &paid, OWNER, burn).unwrap();
+        let sum: f64 = values.iter().map(|value| f64::from(*value)).sum();
+        dests
+            .into_iter()
+            .zip(values)
+            .map(|(uid, value)| (uid, f64::from(value) / sum))
+            .collect()
+    }
+
+    fn close(left: f64, right: f64) -> bool {
+        // One u16 step of the max-upscaled vector, relative to its sum.
+        (left - right).abs() < 1e-4
+    }
+
+    /// Half burned, three paid miners: the verifier gets a third of the miners' half, the
+    /// owner the rest of the burn, and each miner exactly its v3 part of the emission.
+    #[test]
+    fn a_verifier_gets_one_mean_miner_share_out_of_the_burn() {
+        let records = scored();
+        let paid_miners = records.iter().filter(|r| r.normalized_weight > 0).count();
+        assert_eq!(paid_miners, 3);
+        let burn = BurnFraction(5_000);
+        let without = fractions(&records, &[], burn);
+        let with = fractions(&records, &[verifier(90, 1_020, true)], burn);
+        assert!(close(with[&90], 0.5 / 3.0), "{with:?}");
+        assert!(close(with[&OWNER], 0.5 - 0.5 / 3.0), "{with:?}");
+        for record in &records {
+            let uid = record.miner.uid as u16;
+            assert!(
+                close(with[&uid], without[&uid]),
+                "uid {uid}: {with:?} {without:?}"
+            );
+        }
+        assert_eq!(with.len(), 5);
+    }
+
+    /// The verifier never gets more than the burn holds: one paid miner keeps 90%, the
+    /// verifier the 10% burn (not the 90% mean), the owner nothing.
+    #[test]
+    fn a_verifier_is_capped_by_the_burn() {
+        let records: Vec<_> = scored().into_iter().take(1).collect();
+        let with = fractions(&records, &[verifier(90, 7, true)], BurnFraction(1_000));
+        assert!(close(with[&12], 0.9), "{with:?}");
+        assert!(close(with[&90], 0.1), "{with:?}");
+        assert!(!with.contains_key(&OWNER));
+    }
+
+    /// No burn, a full burn, or a verifier the chain no longer names: the vector is the v3
+    /// one, the stale verifier's share left in the burn.
+    #[test]
+    fn no_burn_full_burn_or_a_stale_verifier_pay_nothing() {
+        let records = scored();
+        for burn in [BurnFraction::NONE, BurnFraction(5_000), BurnFraction::FULL] {
+            let stale = if burn == BurnFraction(5_000) {
+                verifier(90, 7, false)
+            } else {
+                verifier(90, 7, true)
+            };
+            let paid = verifier_shares(&[stale], &records, burn).unwrap();
+            assert_eq!(
+                weights(&records, &paid, OWNER, burn).unwrap(),
+                weights(&records, &[], OWNER, burn).unwrap(),
+                "{burn:?}"
+            );
+        }
+    }
+
+    /// Two verifiers split one share by verdicts; when one is stale, the other still gets
+    /// only its own part.
+    #[test]
+    fn verifiers_split_one_share_by_verdicts() {
+        let records = scored();
+        let burn = BurnFraction(5_000);
+        let both = fractions(
+            &records,
+            &[verifier(90, 3, true), verifier(91, 1, true)],
+            burn,
+        );
+        assert!(close(both[&90], 0.5 / 3.0 * 0.75), "{both:?}");
+        assert!(close(both[&91], 0.5 / 3.0 * 0.25), "{both:?}");
+        let one = fractions(
+            &records,
+            &[verifier(90, 3, true), verifier(91, 1, false)],
+            burn,
+        );
+        assert!(close(one[&90], both[&90]), "{one:?}");
+        assert!(!one.contains_key(&91));
+        assert!(close(one[&OWNER], both[&OWNER] + both[&91]), "{one:?}");
+    }
+
+    #[test]
+    fn verifier_shares_never_exceed_the_burn() {
+        assert_eq!(
+            weights(&scored(), &[(90, u128::MAX)], OWNER, BurnFraction(5_000))
+                .unwrap_err()
+                .0,
+            "Verifier shares exceed the burn"
+        );
     }
 
     #[test]
