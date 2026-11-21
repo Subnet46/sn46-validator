@@ -10,7 +10,9 @@ use crate::state::{StateError, StateStore, ValidatorState};
 use sn46_shared::epoch_summary::{
     EpochSummary, EpochSummaryError, MAX_EPOCH_SUMMARY_BYTES, parse_epoch_summary,
 };
-use sn46_shared::scoring::{MinerScore, score_epoch_summary};
+use sn46_shared::scoring::MinerScore;
+#[cfg(test)]
+use sn46_shared::scoring::score_epoch_summary;
 
 /// Any failure `main` logs as `Validator run failed` and maps to exit code 1.
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +28,19 @@ pub enum RunError {
     /// The platform summary could not be fetched.
     #[error("{0}")]
     Fetch(String),
+    /// The summary names an incentive this build does not embed, or one under another
+    /// digest: it is not scored and no weights are set.
+    #[error("{0}")]
+    Incentive(String),
+}
+
+/// The incentive a summary is scored by ([`sn46_shared::incentive::of_summary`]); a summary
+/// whose incentive this build does not embed under that digest is not scored.
+pub fn incentive_of(
+    epoch_summary: &EpochSummary,
+) -> Result<sn46_shared::incentive::Incentive, RunError> {
+    sn46_shared::incentive::of_summary(epoch_summary)
+        .map_err(|error| RunError::Incentive(format!("summary not scored: {error}")))
 }
 
 pub type Fetch<'a> = &'a dyn Fn(&str, Duration) -> Result<Vec<u8>, RunError>;
@@ -127,7 +142,13 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         run.platform_signers,
     )?;
     validate_chain(&epoch_summary, &snapshot)?;
-    let verifiers = check_verifiers(&epoch_summary, &snapshot);
+    let incentive = incentive_of(&epoch_summary)?;
+    // A document without verifier payout pays the listed verifiers nothing.
+    let verifiers = if incentive.verifier_payout {
+        check_verifiers(&epoch_summary, &snapshot)
+    } else {
+        Vec::new()
+    };
     for stale in verifiers.iter().filter(|checked| !checked.on_chain) {
         tracing::warn!(
             "Verifier not paid: UID {} does not hold hotkey {} on the finalized chain",
@@ -157,7 +178,7 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         tracing::info!("Summary already processed summary_id={summary_id}");
         Vec::new()
     } else {
-        let records = score_epoch_summary(&epoch_summary);
+        let records = incentive.score(&epoch_summary);
         saved = ValidatorState {
             summary_id: Some(summary_id.to_owned()),
             summary_digest: Some(digest.to_owned()),
@@ -167,10 +188,12 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         run.state.save(&saved)?;
         log_score_records(&records);
         tracing::info!(
-            "Summary verified summary_id={summary_id} finalized_block={} miners={} signer={}",
+            "Summary verified summary_id={summary_id} finalized_block={} miners={} signer={} incentive={} digest={}",
             snapshot.finalized_block,
             records.len(),
-            epoch_summary.signer
+            epoch_summary.signer,
+            incentive.id,
+            incentive.digest
         );
         records
     };
@@ -198,7 +221,7 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         } else {
             let burn = target_policy(&epoch_summary)?;
             // Retries still need miner scores for partial or zero burn, without logging them again.
-            let retry_records = already_processed.then(|| score_epoch_summary(&epoch_summary));
+            let retry_records = already_processed.then(|| incentive.score(&epoch_summary));
             let message = run.burner.submit(
                 epoch_summary.netuid.get(),
                 snapshot.finalized_block,
@@ -395,7 +418,7 @@ pub(crate) mod tests {
                 log.messages()
                     .iter()
                     .any(|line| line.starts_with("Summary verified ")
-                        && line.ends_with(&format!(" signer={DAVE_SS58}"))),
+                        && line.contains(&format!(" signer={DAVE_SS58} "))),
                 "{signers:?}"
             );
         }
@@ -474,7 +497,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             messages[messages.len() - 2],
-            "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3 signer=5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy"
+            format!(
+                "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3 signer=5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy incentive=relative-v1 digest={}",
+                sn46_shared::incentive::get("relative-v1").unwrap().digest
+            )
         );
     }
 
@@ -504,6 +530,44 @@ pub(crate) mod tests {
         let saved = store.load().unwrap();
         assert_eq!(saved.summary_epoch_end_block, Some(720));
         assert_eq!(saved.burn_epoch_end_block, None);
+    }
+
+    /// A v4 summary is scored by the incentive it names, checked by digest against the
+    /// embedded copy; an unknown one, or another digest, is not scored; v2 and v3 are
+    /// `relative-v1`.
+    #[test]
+    fn a_summary_is_scored_by_the_incentive_it_names() {
+        let v4: EpochSummary = serde_json::from_str(
+            include_str!("../tests/fixtures/epoch_summary_v4.json").trim_end(),
+        )
+        .unwrap();
+        let named = incentive_of(&v4).unwrap();
+        assert_eq!(named.id, "relative-v1-payout");
+        assert!(named.verifier_payout);
+        let mut unknown = v4.clone();
+        unknown.incentive.as_mut().unwrap().id = "relative-v9".into();
+        assert!(
+            incentive_of(&unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("not scored")
+        );
+        let mut other = v4.clone();
+        other.incentive.as_mut().unwrap().digest = "sha256:00".into();
+        assert!(
+            incentive_of(&other)
+                .unwrap_err()
+                .to_string()
+                .contains("digest")
+        );
+        let v3: EpochSummary = serde_json::from_str(
+            include_str!("../tests/fixtures/epoch_summary_v3.json").trim_end(),
+        )
+        .unwrap();
+        let legacy = incentive_of(&v3).unwrap();
+        assert_eq!(legacy.id, "relative-v1");
+        assert!(!legacy.verifier_payout);
+        assert_eq!(legacy.score(&v3), score_epoch_summary(&v3));
     }
 
     /// A v4 summary's verifier rows reach the burn writer with whether the chain still names

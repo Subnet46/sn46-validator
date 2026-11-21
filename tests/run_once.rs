@@ -249,7 +249,10 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
     );
     assert_eq!(
         messages[messages.len() - 2],
-        "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3 signer=5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy"
+        format!(
+            "Summary verified summary_id=local-46-361-720 finalized_block=722 miners=3 signer=5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy incentive=relative-v1 digest={}",
+            sn46_shared::incentive::get("relative-v1").unwrap().digest
+        )
     );
     let golden: Json = serde_json::from_str(include_str!("golden/scoring_cases.json")).unwrap();
     let expected_lines = &golden.as_array().unwrap()[0]["log_lines"];
