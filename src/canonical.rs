@@ -1,11 +1,12 @@
 use serde::Serialize;
 
-/// Compact JSON with keys in byte order regardless of serde_json feature unification. JSON is UTF-8,
-/// so this is a `String`; callers that sign or compare bytes take `as_bytes`.
+/// The canonical JSON every SN46 protocol signs ([`sn46_shared::formats::canonical`]):
+/// compact, keys in byte order whatever serde_json features are unified in, raw UTF-8. JSON is
+/// UTF-8, so this is a `String`; callers that sign or compare bytes take `as_bytes`.
 pub fn canonical_json<T: Serialize + ?Sized>(value: &T) -> String {
-    let mut value = serde_json::to_value(value).expect("value serializes");
-    value.sort_all_objects();
-    serde_json::to_string(&value).expect("value serializes")
+    let bytes =
+        sn46_shared::formats::canonical::serialize_canonical(value).expect("value serializes");
+    String::from_utf8(bytes).expect("canonical JSON is UTF-8")
 }
 
 #[cfg(test)]
