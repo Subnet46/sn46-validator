@@ -34,6 +34,53 @@ pub enum RunError {
     Incentive(String),
 }
 
+/// A v4 summary's incentive checked against the platform's signed history
+/// ([`crate::schedule::verified`]: every record signed by a trusted platform key, for this
+/// network and netuid, chained, admitted by the validation table, each naming a document this
+/// build embeds). The record in force at the summary's epoch must be the one the summary names,
+/// switching to the document it names. A summary that names none is scored only while no
+/// incentive record is in force at its epoch, and only by the genesis `relative-v1` (by id and
+/// digest): a payout document is reachable only through a signed, noticed record. v2 and v3
+/// summaries name no incentive and are not checked here. Anything else sets no weights.
+fn check_transition(
+    named: &sn46_shared::epoch_summary::IncentiveRef,
+    epoch: u64,
+    history: &sn46_shared::schedule::History,
+) -> Result<(), RunError> {
+    let refuse = |reason: String| RunError::Incentive(format!("summary not scored: {reason}"));
+    let in_force = history.in_force(sn46_shared::schedule::Kind::Incentive, epoch);
+    match (&named.transition, in_force) {
+        (None, None) => {
+            if crate::schedule::is_genesis(&named.id, &named.digest) {
+                Ok(())
+            } else {
+                Err(refuse(format!(
+                    "the summary names {} ({}) with no schedule record; only the genesis {} is in force without one",
+                    named.id,
+                    named.digest,
+                    crate::schedule::GENESIS_INCENTIVE
+                )))
+            }
+        }
+        (None, Some((record, id))) => Err(refuse(format!(
+            "the summary names no schedule record, the schedule has {} ({id}) in force at epoch {epoch}",
+            record.id
+        ))),
+        (Some(transition), None) => Err(refuse(format!(
+            "the summary names {transition}, no incentive record is in force at epoch {epoch}"
+        ))),
+        (Some(transition), Some((record, id))) => {
+            if &record.id != transition || id != named.id || record.to_digest != named.digest {
+                return Err(refuse(format!(
+                    "the summary names {transition} ({}), the schedule has {} ({id}) in force at epoch {epoch}",
+                    named.id, record.id
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// The incentive a summary is scored by ([`sn46_shared::incentive::of_summary`]); a summary
 /// whose incentive this build does not embed under that digest is not scored.
 pub fn incentive_of(
@@ -43,7 +90,36 @@ pub fn incentive_of(
         .map_err(|error| RunError::Incentive(format!("summary not scored: {error}")))
 }
 
-pub type Fetch<'a> = &'a dyn Fn(&str, Duration) -> Result<Vec<u8>, RunError>;
+/// What a fetch reads from the platform, each with its own size ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resource {
+    Summary,
+    ScheduleHistory,
+}
+
+impl std::fmt::Display for Resource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Summary => "summary",
+            Self::ScheduleHistory => "schedule history",
+        })
+    }
+}
+
+/// The largest schedule history response read. Runs fetch only the records after the kept
+/// copy (`?since=`), so this bounds the first, whole fetch: some 20,000 records.
+pub const MAX_SCHEDULE_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+
+impl Resource {
+    pub fn limit(self) -> usize {
+        match self {
+            Self::Summary => MAX_EPOCH_SUMMARY_BYTES,
+            Self::ScheduleHistory => MAX_SCHEDULE_HISTORY_BYTES,
+        }
+    }
+}
+
+pub type Fetch<'a> = &'a dyn Fn(&str, Duration, Resource) -> Result<Vec<u8>, RunError>;
 
 /// How soon after a stale summary to look again. The platform publishes each epoch a few
 /// seconds after the chain steps; a poll that lands in that gap sees last epoch's summary.
@@ -60,13 +136,18 @@ pub fn next_delay(outcome: &Result<(), RunError>, poll_interval: Duration) -> Du
     }
 }
 
-pub fn fetch_epoch_summary(url: &str, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub fn fetch_platform(
+    url: &str,
+    timeout: Duration,
+    resource: Resource,
+) -> Result<Vec<u8>, RunError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .user_agent(concat!("sn46-validator/", env!("CARGO_PKG_VERSION")))
         .http_status_as_error(true)
         .build()
         .new_agent();
+    let limit = resource.limit();
     let mut raw = Vec::new();
     agent
         .get(url)
@@ -76,13 +157,15 @@ pub fn fetch_epoch_summary(url: &str, timeout: Duration) -> Result<Vec<u8>, RunE
             response
                 .into_body()
                 .into_reader()
-                .take(MAX_EPOCH_SUMMARY_BYTES as u64 + 1)
+                .take(limit as u64 + 1)
                 .read_to_end(&mut raw)
                 .map_err(ureq::Error::from)
         })
-        .map_err(|error| RunError::Fetch(format!("Platform summary fetch failed: {error}")))?;
-    if raw.is_empty() || raw.len() > MAX_EPOCH_SUMMARY_BYTES {
-        return Err(RunError::Fetch("Platform summary size is invalid".into()));
+        .map_err(|error| RunError::Fetch(format!("Platform {resource} fetch failed: {error}")))?;
+    if raw.is_empty() || raw.len() > limit {
+        return Err(RunError::Fetch(format!(
+            "Platform {resource} size is invalid"
+        )));
     }
     Ok(raw)
 }
@@ -136,13 +219,18 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
     let _lock = run.state.lock()?;
     let snapshot = run.chain.snapshot(run.netuid)?;
     let epoch_summary = parse_signed_summary(
-        &(run.fetch)(run.epoch_summary_url, run.timeout)?,
+        &(run.fetch)(run.epoch_summary_url, run.timeout, Resource::Summary)?,
         run.network,
         run.netuid,
         run.platform_signers,
     )?;
     validate_chain(&epoch_summary, &snapshot)?;
     let incentive = incentive_of(&epoch_summary)?;
+    if let Some(named) = &epoch_summary.incentive {
+        let history = crate::schedule::verified(run)?;
+        let epoch = epoch_summary.epoch_end_block / epoch_summary.tempo.get();
+        check_transition(named, epoch, &history)?;
+    }
     // A document without verifier payout pays the listed verifiers nothing.
     let verifiers = if incentive.verifier_payout {
         check_verifiers(&epoch_summary, &snapshot)
@@ -454,7 +542,7 @@ pub(crate) mod tests {
             state,
             burner,
             timeout: Duration::from_secs(15),
-            fetch: &|url, timeout| {
+            fetch: &|url, timeout, _| {
                 assert_eq!(url, "https://platform.invalid/latest");
                 assert_eq!(timeout, Duration::from_secs(15));
                 Ok(raw())
@@ -514,7 +602,7 @@ pub(crate) mod tests {
             netuids: RefCell::new(vec![]),
         };
         let store = StateStore::new(temp.path().join("state.json"));
-        let v2 = |_: &str, _: Duration| {
+        let v2 = |_: &str, _: Duration, _: Resource| {
             Ok(include_str!("../tests/fixtures/epoch_summary_v2.json")
                 .trim_end()
                 .as_bytes()
@@ -570,22 +658,251 @@ pub(crate) mod tests {
         assert_eq!(legacy.score(&v3), score_epoch_summary(&v3));
     }
 
-    /// A v4 summary's verifier rows reach the burn writer with whether the chain still names
-    /// them, on the first submission and on a retry; a stale one is logged and still lets
-    /// the miners be weighted.
+    /// Each run fetches only the records after the copy it kept; a copy that no longer
+    /// verifies, or that the platform's records do not continue, is dropped for a whole fetch.
     #[test]
-    fn v4_verifier_rows_reach_the_burner_checked_against_the_chain() {
-        let v4 = |_: &str, _: Duration| {
+    fn the_schedule_history_is_fetched_after_the_kept_copy() {
+        use crate::schedule::tests::{key, two_records};
+        let temp = tempfile::tempdir().unwrap();
+        let chain = FixedChain {
+            snapshot: fixture_snapshot(),
+            netuids: RefCell::new(vec![]),
+        };
+        let store = StateStore::new(temp.path().join("state.json"));
+        let burner = FakeBurner::new(&chain.snapshot.hotkeys[12], false);
+        let all = two_records(&key("//Dave"), &key("//Dave"), "local");
+        let published = Cell::new(1);
+        let ignore_since = Cell::new(false);
+        let urls = RefCell::new(Vec::new());
+        let fetch = |url: &str, _: Duration, resource: Resource| {
+            assert_eq!(resource, Resource::ScheduleHistory);
+            urls.borrow_mut().push(url.to_owned());
+            let since: u64 = url.rsplit_once("?since=").unwrap().1.parse().unwrap();
+            let since = if ignore_since.get() { 0 } else { since };
+            let after: Vec<_> = all[..published.get()]
+                .iter()
+                .filter(|record| record.revision > since)
+                .collect();
+            Ok(serde_json::to_vec(&after).unwrap())
+        };
+        let mut arguments = run(&chain, &store, &burner);
+        arguments.fetch = &fetch;
+        let held = || {
+            crate::schedule::verified(&arguments)
+                .unwrap()
+                .records()
+                .len()
+        };
+        assert_eq!(held(), 1);
+        published.set(2);
+        assert_eq!(held(), 2);
+        assert_eq!(held(), 2);
+        let since = |url: &String| url.rsplit_once('=').unwrap().1.to_owned();
+        assert_eq!(
+            urls.borrow().iter().map(since).collect::<Vec<_>>(),
+            ["0", "1", "2"]
+        );
+        assert!(urls.borrow()[0].starts_with("https://platform.invalid/v1/schedule/history"));
+        // The platform answers with records the kept copy already holds: a whole fetch.
+        ignore_since.set(true);
+        urls.borrow_mut().clear();
+        assert_eq!(held(), 2);
+        assert_eq!(
+            urls.borrow().iter().map(since).collect::<Vec<_>>(),
+            ["2", "0"]
+        );
+        // A kept copy that no longer verifies is dropped.
+        ignore_since.set(false);
+        urls.borrow_mut().clear();
+        std::fs::write(temp.path().join("state.schedule.json"), b"[{}]").unwrap();
+        assert_eq!(held(), 2);
+        assert_eq!(urls.borrow().iter().map(since).collect::<Vec<_>>(), ["0"]);
+        // A key no longer trusted invalidates the copy and the history alike.
+        let eve = [crate::schedule::tests::ss58(&key("//Eve"))];
+        arguments.platform_signers = &eve;
+        assert!(crate::schedule::verified(&arguments).is_err());
+    }
+
+    /// A summary naming a schedule record not in force (or none at all) is not scored.
+    #[test]
+    fn a_summary_naming_a_record_not_in_force_is_not_scored() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture_snapshot();
+        snapshot.hotkeys.resize(91, "unused".into());
+        snapshot.last_updates.resize(91, 0);
+        let burner = FakeBurner::new(&snapshot.hotkeys[12], false);
+        let chain = FixedChain {
+            snapshot,
+            netuids: RefCell::new(vec![]),
+        };
+        let store = StateStore::new(temp.path().join("state.json"));
+        let empty = |_: &str, _: Duration, resource: Resource| {
+            if resource == Resource::ScheduleHistory {
+                return Ok(b"[]".to_vec());
+            }
             Ok(include_str!("../tests/fixtures/epoch_summary_v4.json")
                 .trim_end()
                 .as_bytes()
                 .to_vec())
         };
+        let mut arguments = run(&chain, &store, &burner);
+        arguments.fetch = &empty;
+        let error = run_once(&arguments).unwrap_err().to_string();
+        assert!(error.contains("no incentive record is in force"), "{error}");
+        assert!(burner.calls.borrow().is_empty());
+    }
+
+    /// The v4 fixture moved to the epoch ending at `epoch_end` (tempo 360), naming `id` (by
+    /// its embedded digest) and `transition`, signed again by the fixture's key (//Dave).
+    pub(crate) fn v4_summary(epoch_end: u64, id: &str, transition: Option<&str>) -> EpochSummary {
+        use sha2::{Digest, Sha256};
+        let mut summary: EpochSummary = serde_json::from_str(
+            include_str!("../tests/fixtures/epoch_summary_v4.json").trim_end(),
+        )
+        .unwrap();
+        summary.epoch_start_block = epoch_end - 359;
+        summary.epoch_end_block = epoch_end;
+        summary.finalized_block = epoch_end + 2;
+        summary.summary_id = format!("local-46-{}-{epoch_end}", epoch_end - 359);
+        summary.incentive = Some(sn46_shared::epoch_summary::IncentiveRef {
+            digest: sn46_shared::incentive::get(id).unwrap().digest,
+            id: id.into(),
+            transition: transition.map(str::to_owned),
+        });
+        let keypair = crate::schedule::tests::key("//Dave");
+        let payload = summary.signing_payload().unwrap();
+        summary.digest = format!("sha256:{}", hex::encode(Sha256::digest(&payload)));
+        summary.signature = hex::encode(keypair.sign(payload.as_bytes()).0);
+        summary
+    }
+
+    /// A chain at `summary`'s epoch whose roster holds its miners and UID 90.
+    pub(crate) fn chain_at(summary: &EpochSummary) -> FixedChain {
+        let mut snapshot = fixture_snapshot();
+        snapshot.hotkeys.resize(91, "unused".into());
+        snapshot.last_updates.resize(91, 0);
+        snapshot.last_step = summary.epoch_end_block;
+        snapshot.finalized_block = summary.finalized_block;
+        FixedChain {
+            snapshot,
+            netuids: RefCell::new(vec![]),
+        }
+    }
+
+    /// Runs `summary` against `history` (signed records, served whole) on a fresh state.
+    fn score_against(
+        summary: &EpochSummary,
+        history: &[sn46_shared::schedule::Record],
+    ) -> Result<Vec<MinerScore>, RunError> {
+        let temp = tempfile::tempdir().unwrap();
+        let chain = chain_at(summary);
+        let store = StateStore::new(temp.path().join("state.json"));
+        let burner = FakeBurner::new(&chain.snapshot.hotkeys[12], false);
+        let body = summary.canonical_json().unwrap().into_bytes();
+        let records = serde_json::to_vec(history).unwrap();
+        let fetch = move |_: &str, _: Duration, resource: Resource| {
+            Ok(match resource {
+                Resource::Summary => body.clone(),
+                Resource::ScheduleHistory => records.clone(),
+            })
+        };
+        let mut arguments = run(&chain, &store, &burner);
+        arguments.fetch = &fetch;
+        run_once(&arguments)
+    }
+
+    /// `transition: None` belongs to v2 and v3. A v4 summary that names no record is scored
+    /// only while none is in force at its epoch, and only by the genesis `relative-v1` (id and
+    /// digest): a payout document never reaches a summary without its signed, noticed record.
+    #[test]
+    fn a_v4_summary_without_a_transition_is_only_the_genesis_before_any_record() {
+        use crate::schedule::tests::{key, two_records};
+        let dave = key("//Dave");
+        let history = two_records(&dave, &dave, "local");
+        let genesis = v4_summary(720, "relative-v1", None);
+        assert_eq!(score_against(&genesis, &[]).unwrap().len(), 3);
+        // A seed announced later is not in force yet: the genesis still stands.
+        let mut later = history[..1].to_vec();
+        later[0].announced_epoch = 5;
+        later[0].effective_epoch = 5;
+        later[0].sign(|bytes| dave.sign(bytes).0.to_vec()).unwrap();
+        assert_eq!(score_against(&genesis, &later).unwrap().len(), 3);
+        // The payout document with no record behind it, even before any record.
+        let payout = v4_summary(720, "relative-v1-payout", None);
+        let error = score_against(&payout, &[]).unwrap_err().to_string();
+        assert!(error.contains("only the genesis relative-v1"), "{error}");
+        // A record in force: the summary must name it.
+        let error = score_against(&genesis, &history[..1])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("names no schedule record") && error.contains("incentive-1"),
+            "{error}"
+        );
+        assert_eq!(
+            score_against(
+                &v4_summary(720, "relative-v1", Some("incentive-1")),
+                &history
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+        // At epoch 22 the payout switch is in force.
+        let error = score_against(&v4_summary(7920, "relative-v1-payout", None), &history)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incentive-2"), "{error}");
+        score_against(
+            &v4_summary(7920, "relative-v1-payout", Some("incentive-2")),
+            &history,
+        )
+        .unwrap();
+    }
+
+    /// A valid final summary does not make a history valid: one intermediate record switched
+    /// to a document this build does not embed (or under another digest), and the summary
+    /// scored by the genesis document the revert after it returned to is still refused.
+    #[test]
+    fn a_valid_final_summary_after_a_bad_intermediate_record_is_not_scored() {
+        let dave = crate::schedule::tests::key("//Dave");
+        let payout = sn46_shared::incentive::get("relative-v1-payout").unwrap();
+        let summary = v4_summary(8280, "relative-v1", Some("incentive-3"));
+        let good = crate::schedule::tests::through(&dave, &payout.id, &payout.digest);
+        assert_eq!(score_against(&summary, &good).unwrap().len(), 3);
+        for bad in [
+            crate::schedule::tests::through(&dave, "relative-v9", &payout.digest),
+            crate::schedule::tests::through(&dave, &payout.id, "sha256:00"),
+        ] {
+            let error = score_against(&summary, &bad).unwrap_err().to_string();
+            assert!(
+                error.contains("summary not scored") && error.contains("incentive-2"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A v4 summary's verifier rows reach the burn writer with whether the chain still names
+    /// them, on the first submission and on a retry; a stale one is logged and still lets
+    /// the miners be weighted.
+    #[test]
+    fn v4_verifier_rows_reach_the_burner_checked_against_the_chain() {
+        // The fixture at epoch 22, where the two-record history's payout switch is in force.
+        let dave = crate::schedule::tests::key("//Dave");
+        let history =
+            serde_json::to_vec(&crate::schedule::tests::two_records(&dave, &dave, "local"))
+                .unwrap();
+        let summary = v4_summary(7920, "relative-v1-payout", Some("incentive-2"));
+        let body = summary.canonical_json().unwrap().into_bytes();
+        let v4 = move |_: &str, _: Duration, resource: Resource| {
+            if resource == Resource::ScheduleHistory {
+                return Ok(history.clone());
+            }
+            Ok(body.clone())
+        };
         for holds in [true, false] {
             let temp = tempfile::tempdir().unwrap();
-            let mut snapshot = fixture_snapshot();
-            snapshot.hotkeys.resize(91, "unused".into());
-            snapshot.last_updates.resize(91, 0);
+            let mut snapshot = chain_at(&summary).snapshot;
             if holds {
                 snapshot.hotkeys[90] = "5CiPPseXPECbkjWCa6MnjNokrgYjMqmKndv2rSnekmSK2DjL".into();
             }
@@ -813,7 +1130,8 @@ pub(crate) mod tests {
         let mut summary = original;
         summary.created_at_ms = std::num::NonZeroU64::new(summary.created_at_ms.get() + 1).unwrap();
         sign(&mut summary);
-        let changed = |_: &str, _: Duration| Ok(summary.canonical_json().unwrap().into_bytes());
+        let changed =
+            |_: &str, _: Duration, _: Resource| Ok(summary.canonical_json().unwrap().into_bytes());
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &changed;
         assert!(matches!(
@@ -830,7 +1148,8 @@ pub(crate) mod tests {
         sign(&mut summary);
         chain.snapshot.last_step = 1080;
         chain.snapshot.finalized_block = 1082;
-        let fetch = |_: &str, _: Duration| Ok(summary.canonical_json().unwrap().into_bytes());
+        let fetch =
+            |_: &str, _: Duration, _: Resource| Ok(summary.canonical_json().unwrap().into_bytes());
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &fetch;
         assert_eq!(run_once(&arguments).unwrap().len(), 3);

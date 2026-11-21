@@ -9,7 +9,7 @@ use clap::{Args, CommandFactory, Parser, ValueEnum};
 use sn46_shared::identity::decode_registered_ss58;
 use sn46_validator::burn::BittensorBurnWriter;
 use sn46_validator::chain::BittensorChain;
-use sn46_validator::runtime::{Run, RunError, fetch_epoch_summary, next_delay, run_once};
+use sn46_validator::runtime::{Run, RunError, fetch_platform, next_delay, run_once};
 use sn46_validator::state::StateStore;
 use sn46_validator::update;
 use tokio::signal::unix::{SignalKind, signal};
@@ -187,7 +187,7 @@ impl Config {
             state: &self.state,
             burner: &burner,
             timeout: Duration::from_secs(15),
-            fetch: &fetch_epoch_summary,
+            fetch: &fetch_platform,
         })?;
         Ok(())
     }
