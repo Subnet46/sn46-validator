@@ -22,10 +22,13 @@ const FINALIZED: u64 = 722;
 
 /// Serves the fixture summary to every GET, forever, on a background thread.
 fn epoch_summary_server(body: &'static str) -> String {
-    epoch_summary_server_with(move |_| body.to_owned())
+    epoch_summary_server_with(move |_, _| body.to_owned())
 }
 
-fn epoch_summary_server_with(mut body: impl FnMut(usize) -> String + Send + 'static) -> String {
+/// Serves `body(request number, request head)` to every GET.
+fn epoch_summary_server_with(
+    mut body: impl FnMut(usize, &str) -> String + Send + 'static,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!(
         "http://{}/validator/v1/epoch-summaries/latest",
@@ -35,8 +38,8 @@ fn epoch_summary_server_with(mut body: impl FnMut(usize) -> String + Send + 'sta
         for (request_number, stream) in listener.incoming().enumerate() {
             let mut stream = stream.unwrap();
             let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request);
-            let body = body(request_number);
+            let read = stream.read(&mut request).unwrap_or(0);
+            let body = body(request_number, &String::from_utf8_lossy(&request[..read]));
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -208,7 +211,12 @@ fn cli_rejects_empty_summary_url_before_chain_contact() {
 #[test]
 fn run_once_processes_the_fixture_epoch_end_to_end() {
     let epoch = epoch();
-    let epoch_summary_url = epoch_summary_server(FIXTURE.trim_end_matches('\n'));
+    let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = heads.clone();
+    let epoch_summary_url = epoch_summary_server_with(move |_, head| {
+        seen.lock().unwrap().push(head.to_owned());
+        FIXTURE.trim_end_matches('\n').to_owned()
+    });
     let temp = tempfile::tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let wallet_path = wallet(&temp);
@@ -254,6 +262,31 @@ fn run_once_processes_the_fixture_epoch_end_to_end() {
             sn46_shared::incentive::get("relative-v1").unwrap().digest
         )
     );
+    // The summary fetch said what this validator reads, signed with its hotkey (D14).
+    let readiness: Json = {
+        let heads = heads.lock().unwrap();
+        let line = heads[0]
+            .lines()
+            .find_map(|line| line.strip_prefix("x-sn46-readiness: "))
+            .expect("the summary fetch carries the readiness header")
+            .to_owned();
+        serde_json::from_str(&line).unwrap()
+    };
+    assert_eq!(readiness["hotkey"], DEVELOPMENT_HOTKEY);
+    assert_eq!(readiness["summary_versions"], json!([2, 3, 4]));
+    let incentives = readiness["incentives"].as_array().unwrap();
+    assert_eq!(incentives.len(), sn46_shared::incentive::embedded().len());
+    let payload = sn46_validator::readiness::signing_payload(
+        DEVELOPMENT_HOTKEY,
+        &sn46_validator::readiness::accepted(),
+        readiness["issued_at_ms"].as_u64().unwrap(),
+    );
+    let (public, _) = sn46_shared::identity::decode_registered_ss58(DEVELOPMENT_HOTKEY).unwrap();
+    assert!(sn46_shared::identity::verify_sr25519(
+        &public,
+        payload.as_bytes(),
+        &hex::decode(readiness["signature"].as_str().unwrap()).unwrap()
+    ));
     let golden: Json = serde_json::from_str(include_str!("golden/scoring_cases.json")).unwrap();
     let expected_lines = &golden.as_array().unwrap()[0]["log_lines"];
     let score_lines: Vec<Json> = messages
@@ -456,7 +489,7 @@ fn continuous_mode_retries_failures_without_rescoring_and_stops_on_interrupt() {
     let node = epoch();
     node.set_subtensor("CommitRevealWeightsEnabled", vec![], false);
     node.set_events(true);
-    let epoch_summary_url = epoch_summary_server_with(|request| {
+    let epoch_summary_url = epoch_summary_server_with(|request, _| {
         if request == 0 {
             "invalid json"
         } else {
@@ -496,7 +529,7 @@ fn termination_finishes_an_in_flight_run_before_exiting() {
     node.set_events(true);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (finish_tx, finish_rx) = std::sync::mpsc::channel();
-    let epoch_summary_url = epoch_summary_server_with(move |_| {
+    let epoch_summary_url = epoch_summary_server_with(move |_, _| {
         started_tx.send(()).unwrap();
         finish_rx.recv_timeout(Duration::from_secs(15)).unwrap();
         FIXTURE.trim_end_matches('\n').to_owned()

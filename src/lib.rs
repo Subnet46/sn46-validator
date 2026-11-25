@@ -2,6 +2,7 @@ pub mod burn;
 pub mod canonical;
 pub mod chain;
 mod commit_reveal;
+pub mod readiness;
 pub mod runtime;
 pub mod schedule;
 pub mod scoring;

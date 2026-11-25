@@ -167,6 +167,7 @@ fn fetch_records(run: &Run<'_>, since: u64) -> Result<Vec<Record>, RunError> {
         &history_url(run.epoch_summary_url, since)?,
         run.timeout,
         Resource::ScheduleHistory,
+        None,
     )?;
     serde_json::from_slice(&raw).map_err(|error| {
         RunError::Incentive(format!("summary not scored: schedule history: {error}"))

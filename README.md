@@ -7,6 +7,8 @@ The validator accepts a summary signed by any key in `PLATFORM_SIGNER` (`--platf
 
 The record a v4 summary was scored under is kept in `state.transitions.json` (`head`, the `previous` one and the summary), written before `state.json` commits the summary. A later summary must be scored under that record or one after it, in a history that still holds it: a platform whose history lost or rewrote it is refused. After a stop between the two writes the head rolls back; after an older release advanced the state it is derived again from the history.
 
+Every summary fetch carries an `x-sn46-readiness` header signed with the validator hotkey: the summary schema versions this release reads (2, 3, 4), the incentive documents it embeds (id and digest) and when it was made. The platform publishes schema-v4 summaries, and schedules a new incentive document, only once each validator it waits for has said it reads them; a header is accepted for a few minutes and only once.
+
 Weights follow the summary: miners by their scores, scaled so they together earn the summary's signed USD target, and the rest burned on the subnet owner UID. A schema-v4 summary also lists the verifiers that checked the epoch's proofs, each on its own registered UID: together they are paid one paid miner's mean share out of the burn, never more than the burn holds, so the miners' part is the same as without them. A verifier whose UID no longer holds the listed hotkey on the finalized chain is not paid and its share stays burned; the miners are weighted either way. The log shows each `Verifier share ...` line next to `Weights prepared ...`. Releases before this one refuse v4 summaries and set no weights while the platform publishes them.
 
 

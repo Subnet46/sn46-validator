@@ -37,6 +37,8 @@ pub struct BurnError(pub String);
 pub trait Burner {
     /// The validator hotkey's SS58 address (`wallet.hotkey.ss58_address`).
     fn hotkey(&self) -> &str;
+    /// The hotkey's sr25519 signature over `message` (the readiness header).
+    fn sign(&self, message: &[u8]) -> [u8; 64];
     /// Submit this epoch's weights pinned to `finalized_block`; the returned message is
     /// logged. `verifiers` are the summary's verifier rows (none before schema v4), paid
     /// out of the burn once it is priced.
@@ -701,6 +703,10 @@ impl<'a> BittensorBurnWriter<'a> {
 impl Burner for BittensorBurnWriter<'_> {
     fn hotkey(&self) -> &str {
         &self.hotkey
+    }
+
+    fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.signer.sign_bytes(message)
     }
 
     fn submit(

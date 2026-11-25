@@ -120,7 +120,10 @@ impl Resource {
     }
 }
 
-pub type Fetch<'a> = &'a dyn Fn(&str, Duration, Resource) -> Result<Vec<u8>, RunError>;
+/// A GET of `url` within the timeout, read up to the resource's ceiling, with the readiness
+/// header ([`crate::readiness`]) when one is given.
+pub type Fetch<'a> =
+    &'a dyn Fn(&str, Duration, Resource, Option<&str>) -> Result<Vec<u8>, RunError>;
 
 /// How soon after a stale summary to look again. The platform publishes each epoch a few
 /// seconds after the chain steps; a poll that lands in that gap sees last epoch's summary.
@@ -141,6 +144,7 @@ pub fn fetch_platform(
     url: &str,
     timeout: Duration,
     resource: Resource,
+    readiness: Option<&str>,
 ) -> Result<Vec<u8>, RunError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -150,9 +154,11 @@ pub fn fetch_platform(
         .new_agent();
     let limit = resource.limit();
     let mut raw = Vec::new();
-    agent
-        .get(url)
-        .header("Accept", "application/json")
+    let mut request = agent.get(url).header("Accept", "application/json");
+    if let Some(readiness) = readiness {
+        request = request.header(crate::readiness::HEADER, readiness);
+    }
+    request
         .call()
         .and_then(|response| {
             response
@@ -219,8 +225,19 @@ fn parse_signed_summary(
 pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
     let _lock = run.state.lock()?;
     let snapshot = run.chain.snapshot(run.netuid)?;
+    let issued_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let readiness = crate::readiness::header(run.burner.hotkey(), issued_at_ms, |bytes| {
+        run.burner.sign(bytes)
+    });
     let epoch_summary = parse_signed_summary(
-        &(run.fetch)(run.epoch_summary_url, run.timeout, Resource::Summary)?,
+        &(run.fetch)(
+            run.epoch_summary_url,
+            run.timeout,
+            Resource::Summary,
+            Some(&readiness),
+        )?,
         run.network,
         run.netuid,
         run.platform_signers,
@@ -439,6 +456,9 @@ pub(crate) mod tests {
         fn hotkey(&self) -> &str {
             &self.hotkey
         }
+        fn sign(&self, _: &[u8]) -> [u8; 64] {
+            [0; 64]
+        }
         fn submit(
             &self,
             netuid: u64,
@@ -573,7 +593,7 @@ pub(crate) mod tests {
             state,
             burner,
             timeout: Duration::from_secs(15),
-            fetch: &|url, timeout, _| {
+            fetch: &|url, timeout, _, _| {
                 assert_eq!(url, "https://platform.invalid/latest");
                 assert_eq!(timeout, Duration::from_secs(15));
                 Ok(raw())
@@ -633,7 +653,7 @@ pub(crate) mod tests {
             netuids: RefCell::new(vec![]),
         };
         let store = StateStore::new(temp.path().join("state.json"));
-        let v2 = |_: &str, _: Duration, _: Resource| {
+        let v2 = |_: &str, _: Duration, _: Resource, _: Option<&str>| {
             Ok(include_str!("../tests/fixtures/epoch_summary_v2.json")
                 .trim_end()
                 .as_bytes()
@@ -705,7 +725,7 @@ pub(crate) mod tests {
         let published = Cell::new(1);
         let ignore_since = Cell::new(false);
         let urls = RefCell::new(Vec::new());
-        let fetch = |url: &str, _: Duration, resource: Resource| {
+        let fetch = |url: &str, _: Duration, resource: Resource, _: Option<&str>| {
             assert_eq!(resource, Resource::ScheduleHistory);
             urls.borrow_mut().push(url.to_owned());
             let since: u64 = url.rsplit_once("?since=").unwrap().1.parse().unwrap();
@@ -767,7 +787,7 @@ pub(crate) mod tests {
             netuids: RefCell::new(vec![]),
         };
         let store = StateStore::new(temp.path().join("state.json"));
-        let empty = |_: &str, _: Duration, resource: Resource| {
+        let empty = |_: &str, _: Duration, resource: Resource, _: Option<&str>| {
             if resource == Resource::ScheduleHistory {
                 return Ok(b"[]".to_vec());
             }
@@ -831,7 +851,7 @@ pub(crate) mod tests {
         let burner = FakeBurner::new(&chain.snapshot.hotkeys[12], false);
         let body = summary.canonical_json().unwrap().into_bytes();
         let records = serde_json::to_vec(history).unwrap();
-        let fetch = move |_: &str, _: Duration, resource: Resource| {
+        let fetch = move |_: &str, _: Duration, resource: Resource, _: Option<&str>| {
             Ok(match resource {
                 Resource::Summary => body.clone(),
                 Resource::ScheduleHistory => records.clone(),
@@ -923,7 +943,7 @@ pub(crate) mod tests {
         let burner = FakeBurner::new(&chain.snapshot.hotkeys[12], false);
         let body = summary.canonical_json().unwrap().into_bytes();
         let records = serde_json::to_vec(history).unwrap();
-        let fetch = move |_: &str, _: Duration, resource: Resource| {
+        let fetch = move |_: &str, _: Duration, resource: Resource, _: Option<&str>| {
             Ok(match resource {
                 Resource::Summary => body.clone(),
                 Resource::ScheduleHistory => records.clone(),
@@ -1076,7 +1096,7 @@ pub(crate) mod tests {
                 .unwrap();
         let summary = v4_summary(7920, "relative-v1-payout", Some("incentive-2"));
         let body = summary.canonical_json().unwrap().into_bytes();
-        let v4 = move |_: &str, _: Duration, resource: Resource| {
+        let v4 = move |_: &str, _: Duration, resource: Resource, _: Option<&str>| {
             if resource == Resource::ScheduleHistory {
                 return Ok(history.clone());
             }
@@ -1312,8 +1332,9 @@ pub(crate) mod tests {
         let mut summary = original;
         summary.created_at_ms = std::num::NonZeroU64::new(summary.created_at_ms.get() + 1).unwrap();
         sign(&mut summary);
-        let changed =
-            |_: &str, _: Duration, _: Resource| Ok(summary.canonical_json().unwrap().into_bytes());
+        let changed = |_: &str, _: Duration, _: Resource, _: Option<&str>| {
+            Ok(summary.canonical_json().unwrap().into_bytes())
+        };
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &changed;
         assert!(matches!(
@@ -1330,8 +1351,9 @@ pub(crate) mod tests {
         sign(&mut summary);
         chain.snapshot.last_step = 1080;
         chain.snapshot.finalized_block = 1082;
-        let fetch =
-            |_: &str, _: Duration, _: Resource| Ok(summary.canonical_json().unwrap().into_bytes());
+        let fetch = |_: &str, _: Duration, _: Resource, _: Option<&str>| {
+            Ok(summary.canonical_json().unwrap().into_bytes())
+        };
         let mut arguments = run(&chain, &store, &burner);
         arguments.fetch = &fetch;
         assert_eq!(run_once(&arguments).unwrap().len(), 3);
