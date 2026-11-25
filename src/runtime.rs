@@ -7,6 +7,7 @@ use crate::burn::{BurnError, BurnPolicy, Burner};
 use crate::chain::{Chain, ChainError, ChainSnapshot, check_verifiers, validate_chain};
 use crate::scoring::log_score_records;
 use crate::state::{StateError, StateStore, ValidatorState};
+use crate::transitions::{Head, RecordRef, Transitions, TransitionsStore, check_head};
 use sn46_shared::epoch_summary::{
     EpochSummary, EpochSummaryError, MAX_EPOCH_SUMMARY_BYTES, parse_epoch_summary,
 };
@@ -46,13 +47,13 @@ fn check_transition(
     named: &sn46_shared::epoch_summary::IncentiveRef,
     epoch: u64,
     history: &sn46_shared::schedule::History,
-) -> Result<(), RunError> {
+) -> Result<Option<sn46_shared::schedule::Record>, RunError> {
     let refuse = |reason: String| RunError::Incentive(format!("summary not scored: {reason}"));
     let in_force = history.in_force(sn46_shared::schedule::Kind::Incentive, epoch);
     match (&named.transition, in_force) {
         (None, None) => {
             if crate::schedule::is_genesis(&named.id, &named.digest) {
-                Ok(())
+                Ok(None)
             } else {
                 Err(refuse(format!(
                     "the summary names {} ({}) with no schedule record; only the genesis {} is in force without one",
@@ -76,7 +77,7 @@ fn check_transition(
                     named.id, record.id
                 )));
             }
-            Ok(())
+            Ok(Some(record.clone()))
         }
     }
 }
@@ -226,11 +227,33 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
     )?;
     validate_chain(&epoch_summary, &snapshot)?;
     let incentive = incentive_of(&epoch_summary)?;
-    if let Some(named) = &epoch_summary.incentive {
-        let history = crate::schedule::verified(run)?;
-        let epoch = epoch_summary.epoch_end_block / epoch_summary.tempo.get();
-        check_transition(named, epoch, &history)?;
-    }
+    let mut saved = run.state.load()?;
+    let transitions = TransitionsStore::beside(run.state);
+    let head = transitions.reconcile(&saved)?;
+    // The record this summary is scored under, and the head it moves from.
+    let (scored_under, held) = match &epoch_summary.incentive {
+        Some(named) => {
+            let history = crate::schedule::verified(run)?;
+            let tempo = epoch_summary.tempo.get();
+            let epoch = epoch_summary.epoch_end_block / tempo;
+            let record = check_transition(named, epoch, &history)?;
+            let held = head.resolve(
+                &history,
+                saved.summary_epoch_end_block.map(|end| end / tempo),
+            );
+            check_head(held.as_ref(), record.as_ref(), &history)
+                .map_err(|error| RunError::Incentive(format!("summary not scored: {error}")))?;
+            (record.as_ref().map(RecordRef::from), held)
+        }
+        // v2 and v3 name no record: the head stays.
+        None => {
+            let held = match head {
+                Head::Known(held) => held,
+                Head::Derive => None,
+            };
+            (held.clone(), held)
+        }
+    };
     // A document without verifier payout pays the listed verifiers nothing.
     let verifiers = if incentive.verifier_payout {
         check_verifiers(&epoch_summary, &snapshot)
@@ -244,7 +267,6 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
             stale.verifier.hotkey
         );
     }
-    let mut saved = run.state.load()?;
     let summary_id = epoch_summary.summary_id.as_str();
     let digest = epoch_summary.digest.as_str();
     let epoch_summary_end = epoch_summary.epoch_end_block;
@@ -267,6 +289,15 @@ pub fn run_once(run: &Run<'_>) -> Result<Vec<MinerScore>, RunError> {
         Vec::new()
     } else {
         let records = incentive.score(&epoch_summary);
+        // Before the state commits the summary: a run stopped between the two leaves the
+        // transitions ahead, and the next one rolls them back to `previous`.
+        transitions.save(&Transitions {
+            head: scored_under,
+            previous: held,
+            summary_digest: digest.to_owned(),
+            summary_epoch_end_block: epoch_summary_end,
+            summary_id: summary_id.to_owned(),
+        })?;
         saved = ValidatorState {
             summary_id: Some(summary_id.to_owned()),
             summary_digest: Some(digest.to_owned()),
@@ -880,6 +911,157 @@ pub(crate) mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// A run over `summary` and `history` on `store`, the chain at the summary's epoch.
+    fn run_on(
+        store: &StateStore,
+        summary: &EpochSummary,
+        history: &[sn46_shared::schedule::Record],
+    ) -> Result<Vec<MinerScore>, RunError> {
+        let chain = chain_at(summary);
+        let burner = FakeBurner::new(&chain.snapshot.hotkeys[12], false);
+        let body = summary.canonical_json().unwrap().into_bytes();
+        let records = serde_json::to_vec(history).unwrap();
+        let fetch = move |_: &str, _: Duration, resource: Resource| {
+            Ok(match resource {
+                Resource::Summary => body.clone(),
+                Resource::ScheduleHistory => records.clone(),
+            })
+        };
+        let mut arguments = run(&chain, store, &burner);
+        arguments.fetch = &fetch;
+        run_once(&arguments)
+    }
+
+    fn reference(record: &sn46_shared::schedule::Record) -> Option<RecordRef> {
+        Some(RecordRef::from(record))
+    }
+
+    /// The validator killed at every write and rename boundary of a run (the schedule copy,
+    /// the transitions, the state, the burn record) starts again on the same files and ends
+    /// where an uninterrupted run ends. A kill between the transitions and the state leaves the
+    /// head ahead: it rolls back, so a platform that lost the newer record (restored, serving
+    /// the summary the state holds) is still followed.
+    #[test]
+    fn a_kill_at_any_write_boundary_recovers_on_restart() {
+        use crate::schedule::tests::{key, two_records};
+        use crate::state::crash;
+        let dave = key("//Dave");
+        let history = two_records(&dave, &dave, "local");
+        let first = v4_summary(720, "relative-v1", Some("incentive-1"));
+        let second = v4_summary(7920, "relative-v1-payout", Some("incentive-2"));
+        let mut rolled_back = 0;
+        let mut at = 0;
+        loop {
+            let temp = tempfile::tempdir().unwrap();
+            let store = StateStore::new(temp.path().join("state.json"));
+            let transitions = TransitionsStore::beside(&store);
+            run_on(&store, &first, &history).unwrap();
+            crash::arm(Some(at));
+            let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_on(&store, &second, &history)
+            }))
+            .is_err();
+            crash::arm(None);
+            if !killed {
+                assert!(at >= 6, "only {at} boundaries");
+                break;
+            }
+            let ahead = store.load().unwrap().summary_id.as_deref() == Some("local-46-361-720")
+                && transitions
+                    .load()
+                    .unwrap()
+                    .is_some_and(|written| written.summary_id == second.summary_id);
+            if ahead {
+                // The platform restored without incentive-2, still serving the first summary.
+                rolled_back += 1;
+                let restored = TransitionsStore::beside(&store);
+                run_on(&store, &first, &history[..1]).unwrap();
+                assert_eq!(
+                    restored.load().unwrap().unwrap().head,
+                    reference(&history[0]),
+                    "boundary {at}"
+                );
+            }
+            run_on(&store, &second, &history).unwrap();
+            let state = store.load().unwrap();
+            assert_eq!(
+                state.summary_id.as_deref(),
+                Some(second.summary_id.as_str())
+            );
+            assert_eq!(state.burn_epoch_end_block, Some(7920), "boundary {at}");
+            assert_eq!(
+                transitions.load().unwrap().unwrap(),
+                Transitions {
+                    head: reference(&history[1]),
+                    previous: reference(&history[0]),
+                    summary_digest: second.digest.clone(),
+                    summary_epoch_end_block: 7920,
+                    summary_id: second.summary_id.clone(),
+                },
+                "boundary {at}"
+            );
+            at += 1;
+        }
+        // After the transitions' rename, and before the state's write and its rename.
+        assert_eq!(rolled_back, 3);
+        assert_eq!(crash::passed(), 0);
+    }
+
+    /// A state an older release advanced (no transitions of its own) has its head derived
+    /// again at its epoch; a history that no longer holds the head is refused.
+    #[test]
+    fn a_head_is_derived_after_an_older_release_and_must_stay_in_the_history() {
+        use crate::schedule::tests::{key, two_records};
+        let dave = key("//Dave");
+        let history = two_records(&dave, &dave, "local");
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let transitions = TransitionsStore::beside(&store);
+        run_on(
+            &store,
+            &v4_summary(720, "relative-v1", Some("incentive-1")),
+            &history,
+        )
+        .unwrap();
+        // The older release scored the epoch-22 summary and wrote only its state.
+        let second = v4_summary(7920, "relative-v1-payout", Some("incentive-2"));
+        store
+            .save(&ValidatorState {
+                summary_id: Some(second.summary_id.clone()),
+                summary_digest: Some(second.digest.clone()),
+                summary_epoch_end_block: Some(7920),
+                burn_epoch_end_block: Some(7920),
+            })
+            .unwrap();
+        let third = v4_summary(8280, "relative-v1-payout", Some("incentive-2"));
+        run_on(&store, &third, &history).unwrap();
+        let written = transitions.load().unwrap().unwrap();
+        assert_eq!(written.previous, reference(&history[1]));
+        assert_eq!(written.head, reference(&history[1]));
+        // The platform's history now lacks incentive-2 (the kept copy gone too, so it is
+        // fetched whole): the genesis summary of the fresh history does not continue the head.
+        let cache = temp.path().join("state.schedule.json");
+        std::fs::remove_file(&cache).unwrap();
+        let fourth = v4_summary(8640, "relative-v1", None);
+        let error = run_on(&store, &fourth, &[]).unwrap_err().to_string();
+        assert!(error.contains("no longer holds incentive-2"), "{error}");
+        // Nor does a history whose incentive-2 is another record under the same id.
+        std::fs::remove_file(&cache).unwrap_or_default();
+        let mut rewritten = history.clone();
+        rewritten[1].effective_epoch += 1;
+        rewritten[1]
+            .sign(|bytes| dave.sign(bytes).0.to_vec())
+            .unwrap();
+        let error = run_on(
+            &store,
+            &v4_summary(8640, "relative-v1-payout", Some("incentive-2")),
+            &rewritten,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no longer holds incentive-2"), "{error}");
     }
 
     /// A v4 summary's verifier rows reach the burn writer with whether the chain still names

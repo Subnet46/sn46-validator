@@ -43,6 +43,10 @@ pub enum StateError {
     ChangedEpochSummary,
     #[error("Validator state could not be saved")]
     Save(#[source] std::io::Error),
+    #[error("Validator transitions are unreadable")]
+    ReadTransitions(#[source] std::io::Error),
+    #[error("Validator transitions are unreadable")]
+    MalformedTransitions(#[source] serde_json::Error),
 }
 
 /// Fields are in key order, so serialising it yields the canonical state bytes.
@@ -192,6 +196,8 @@ fn write_durably(
     data: &[u8],
 ) -> std::io::Result<()> {
     create_directory(parent)?;
+    #[cfg(test)]
+    crash::boundary();
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -202,8 +208,45 @@ fn write_durably(
     file.write_all(data)?;
     file.sync_all()?;
     drop(file);
+    #[cfg(test)]
+    crash::boundary();
     fs::rename(temporary, target)?;
+    #[cfg(test)]
+    crash::boundary();
     File::open(parent)?.sync_all()
+}
+
+/// Simulated kills for the crash tests: every write and rename of a durable file is a
+/// boundary, and the one armed panics there, so the file is left as a killed process leaves
+/// it (no clean-up of the temporary, no later write).
+#[cfg(test)]
+pub(crate) mod crash {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<Option<usize>> = const { Cell::new(None) };
+        static PASSED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Kill the thread at boundary `at` (counted from 0) from now on; `None` disarms.
+    pub(crate) fn arm(at: Option<usize>) {
+        ARMED.set(at);
+        PASSED.set(0);
+    }
+
+    /// The boundaries passed since the last `arm`.
+    pub(crate) fn passed() -> usize {
+        PASSED.get()
+    }
+
+    pub(super) fn boundary() {
+        let passed = PASSED.get();
+        PASSED.set(passed + 1);
+        if ARMED.get() == Some(passed) {
+            ARMED.set(None);
+            panic!("killed at write boundary {passed}");
+        }
+    }
 }
 
 fn create_directory(path: &Path) -> std::io::Result<()> {
